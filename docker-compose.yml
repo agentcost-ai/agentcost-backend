@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  backend:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///./agentcost.db
+      - SECRET_KEY=your-secret-key-change-in-production
+      - DEBUG=true
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+
+  # Uncomment for PostgreSQL in production
+  # postgres:
+  #   image: postgres:15
+  #   environment:
+  #     POSTGRES_USER: agentcost
+  #     POSTGRES_PASSWORD: agentcost
+  #     POSTGRES_DB: agentcost
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   restart: unless-stopped
+
+# volumes:
+#   postgres_data:
