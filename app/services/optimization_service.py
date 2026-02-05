@@ -49,9 +49,6 @@ class OptimizationService:
         It does NOT create or update recommendation records.
         Used internally by get_suggestions() and get_summary().
         """
-        # Ensure baselines exist for anomaly detection (auto-compute if first time)
-        await self.baseline_service.ensure_baselines_exist(project_id, days)
-        
         end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(days=days)
         
@@ -84,30 +81,33 @@ class OptimizationService:
         project_id: str,
         days: int = 30,
         include_low_priority: bool = True,
+        persist_recommendations: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Analyze usage and generate optimization suggestions.
         
-        This method generates suggestions AND persists the top 10 as recommendations
+        By default, this method only generates suggestions (no side effects).
+        Set persist_recommendations=True to persist the top 10 as recommendations
         for tracking user actions (implement/dismiss).
         """
         # Generate suggestions without side effects
         suggestions = await self._generate_suggestions(project_id, days, include_low_priority)
         
-        # Persist top recommendations for tracking (with de-duplication and cooldowns)
-        for suggestion in suggestions[:10]:
-            await self.tracking_service.create_recommendation(
-                project_id=project_id,
-                recommendation_type=suggestion.get("type", "unknown"),
-                title=suggestion.get("title", ""),
-                description=suggestion.get("description", ""),
-                agent_name=suggestion.get("agent_name"),
-                model=suggestion.get("model"),
-                alternative_model=suggestion.get("alternative_model"),
-                estimated_monthly_savings=suggestion.get("estimated_savings_monthly", 0),
-                estimated_savings_percent=suggestion.get("estimated_savings_percent", 0),
-                metrics_snapshot=suggestion.get("metrics"),
-            )
+        if persist_recommendations:
+            # Persist top recommendations for tracking (with de-duplication and cooldowns)
+            for suggestion in suggestions[:10]:
+                await self.tracking_service.create_recommendation(
+                    project_id=project_id,
+                    recommendation_type=suggestion.get("type", "unknown"),
+                    title=suggestion.get("title", ""),
+                    description=suggestion.get("description", ""),
+                    agent_name=suggestion.get("agent_name"),
+                    model=suggestion.get("model"),
+                    alternative_model=suggestion.get("alternative_model"),
+                    estimated_monthly_savings=suggestion.get("estimated_savings_monthly", 0),
+                    estimated_savings_percent=suggestion.get("estimated_savings_percent", 0),
+                    metrics_snapshot=suggestion.get("metrics"),
+                )
         
         return suggestions
     
@@ -151,11 +151,33 @@ class OptimizationService:
             
             if calls < 10 or cost < 0.01:
                 continue
+
+            capability_state = await self._infer_capability_requirements(
+                project_id=project_id,
+                agent_name=agent,
+                model=model,
+                start_time=start_time,
+                end_time=end_time,
+            )
+
+            requires_vision = capability_state.get("requires_vision") == "true"
+            requires_function_calling = (
+                capability_state.get("requires_function_calling") == "true"
+            )
+            requires_json_mode = (
+                capability_state.get("requires_json_mode") == "true"
+            )
+
+            # If JSON mode is required but support cannot be verified, skip downgrade suggestions
+            if requires_json_mode:
+                continue
             
             alternatives = await self.pricing_service.discover_alternatives(
                 model=model,
                 avg_output_tokens=int(avg_output),
                 avg_input_tokens=int(avg_input),
+                requires_vision=requires_vision,
+                requires_function_calling=requires_function_calling,
                 max_results=3,
             )
             
@@ -183,8 +205,9 @@ class OptimizationService:
                     current_model=model,
                     alternative_model=alt_model,
                     monthly_savings=monthly_savings,
-                    quality_impact=alt["quality_impact"],
+                    quality_impact=alt.get("quality_impact"),
                     calls=calls,
+                    capability_state=capability_state,
                 )
                 
                 suggestions.append({
@@ -208,6 +231,7 @@ class OptimizationService:
                         "avg_input_tokens": round(avg_input, 1),
                         "savings_percentage": alt["savings"]["percentage"],
                         "quality_impact": alt["quality_impact"],
+                        "capability_requirements": capability_state,
                         # Confidence data for "Proven" vs "Suggested" badge
                         "source": alt.get("source"),  # "learned" or "dynamic"
                         "confidence_score": alt.get("confidence_score"),
@@ -232,9 +256,10 @@ class OptimizationService:
         for opp in opportunities:
             agent = opp["agent_name"]
             duplicate_rate = opp["duplicate_rate"]
-            monthly_savings = opp["estimated_monthly_savings"]
+            monthly_savings = opp.get("estimated_monthly_savings")
+            savings_estimated = opp.get("savings_estimated", False)
             
-            priority = self._calculate_priority(monthly_savings)
+            priority = self._calculate_priority(monthly_savings or 0)
             
             action_items = self._build_caching_actions(
                 agent=agent,
@@ -249,10 +274,11 @@ class OptimizationService:
                 "title": f"Add caching for {agent}",
                 "description": (
                     f"Agent '{agent}' has {duplicate_rate}% duplicate queries. "
-                    f"Implementing response caching could save approximately "
-                    f"${monthly_savings:.2f}/month based on observed patterns."
+                    "Implementing response caching could reduce repeat costs."
                 ),
-                "estimated_savings_monthly": round(monthly_savings, 2),
+                "estimated_savings_monthly": (
+                    round(monthly_savings, 2) if monthly_savings is not None else None
+                ),
                 "estimated_savings_percent": round(duplicate_rate, 1),
                 "agent_name": agent,
                 "model": None,
@@ -263,6 +289,8 @@ class OptimizationService:
                     "total_calls": opp["total_calls"],
                     "duplicate_calls": opp["duplicate_calls"],
                     "duplicate_rate": duplicate_rate,
+                    "savings_estimated": savings_estimated,
+                    "coverage_days": opp.get("coverage_days"),
                 },
             })
         
@@ -537,11 +565,12 @@ class OptimizationService:
         current_model: str,
         alternative_model: str,
         monthly_savings: float,
-        quality_impact: str,
+        quality_impact: Optional[str],
         calls: int,
+        capability_state: Optional[Dict[str, str]] = None,
     ) -> List[str]:
         actions = []
-        
+
         if quality_impact == "minimal":
             actions.append(
                 f"Run A/B test: route 10% of {agent} traffic to {alternative_model} "
@@ -552,11 +581,25 @@ class OptimizationService:
                 f"Evaluate {alternative_model} on your {agent} test suite - "
                 f"expect some quality differences"
             )
-        else:
+        elif quality_impact == "significant":
             actions.append(
                 f"Thoroughly test {alternative_model} - significant capability "
                 f"differences expected vs {current_model}"
             )
+        else:
+            actions.append(
+                f"Evaluate {alternative_model} against {current_model} with a representative test set"
+            )
+
+        if capability_state:
+            unknown_caps = [
+                name for name, state in capability_state.items() if state == "unknown"
+            ]
+            if unknown_caps:
+                actions.append(
+                    "Capability requirements are unknown for this agent/model. "
+                    "Validate vision, function-calling, and JSON mode needs before switching."
+                )
         
         if calls > 1000:
             actions.append(
@@ -745,6 +788,99 @@ class OptimizationService:
             return "medium"
         else:
             return "low"
+
+    async def _infer_capability_requirements(
+        self,
+        project_id: str,
+        agent_name: str,
+        model: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> Dict[str, str]:
+        """
+        Infer capability requirements from historical event metadata.
+
+        Returns string states: "true", "false", or "unknown".
+        """
+        total_query = select(func.count(Event.id)).where(
+            Event.project_id == project_id,
+            Event.agent_name == agent_name,
+            Event.model == model,
+            Event.timestamp >= start_time,
+            Event.timestamp <= end_time,
+        )
+        total_result = await self.db.execute(total_query)
+        total_calls = int(total_result.scalar() or 0)
+
+        meta_query = select(Event.extra_data).where(
+            Event.project_id == project_id,
+            Event.agent_name == agent_name,
+            Event.model == model,
+            Event.timestamp >= start_time,
+            Event.timestamp <= end_time,
+            Event.extra_data.isnot(None),
+        ).order_by(Event.timestamp.desc()).limit(200)
+
+        meta_result = await self.db.execute(meta_query)
+        metadata_rows = [row[0] for row in meta_result.all() if row and row[0]]
+
+        if total_calls < 10 or len(metadata_rows) == 0:
+            return {
+                "requires_vision": "unknown",
+                "requires_function_calling": "unknown",
+                "requires_json_mode": "unknown",
+            }
+
+        requires_vision = False
+        requires_function_calling = False
+        requires_json_mode = False
+
+        for meta in metadata_rows:
+            if not isinstance(meta, dict):
+                continue
+
+            if self._detect_vision(meta):
+                requires_vision = True
+            if self._detect_function_calling(meta):
+                requires_function_calling = True
+            if self._detect_json_mode(meta):
+                requires_json_mode = True
+
+        return {
+            "requires_vision": "true" if requires_vision else "false",
+            "requires_function_calling": "true" if requires_function_calling else "false",
+            "requires_json_mode": "true" if requires_json_mode else "false",
+        }
+
+    def _detect_vision(self, meta: Dict[str, Any]) -> bool:
+        vision_keys = {"vision", "image", "images", "image_url", "input_image", "input_images"}
+        if any(k in meta for k in vision_keys):
+            return True
+
+        messages = meta.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") in {"image_url", "input_image"}:
+                            return True
+        return False
+
+    def _detect_function_calling(self, meta: Dict[str, Any]) -> bool:
+        function_keys = {"tools", "tool_calls", "functions", "function_call", "tool_choice"}
+        return any(k in meta for k in function_keys)
+
+    def _detect_json_mode(self, meta: Dict[str, Any]) -> bool:
+        if meta.get("json_mode") is True:
+            return True
+        response_format = meta.get("response_format")
+        if isinstance(response_format, dict):
+            if response_format.get("type") in {"json_object", "json_schema"}:
+                return True
+        if "json_schema" in meta:
+            return True
+        return False
     
     async def get_summary(
         self,
@@ -760,7 +896,7 @@ class OptimizationService:
         # Use _generate_suggestions to avoid side effects
         suggestions = await self._generate_suggestions(project_id, days)
         
-        total_savings = sum(s.get("estimated_savings_monthly", 0) for s in suggestions)
+        total_savings = sum((s.get("estimated_savings_monthly") or 0) for s in suggestions)
         high_priority = [s for s in suggestions if s.get("priority") == "high"]
         
         # Get current spend for context
@@ -787,7 +923,7 @@ class OptimizationService:
             if stype not in type_breakdown:
                 type_breakdown[stype] = {"count": 0, "savings": 0}
             type_breakdown[stype]["count"] += 1
-            type_breakdown[stype]["savings"] += s.get("estimated_savings_monthly", 0)
+            type_breakdown[stype]["savings"] += s.get("estimated_savings_monthly") or 0
         
         # Context for empty state messaging
         # has_data: Are there any events to analyze?

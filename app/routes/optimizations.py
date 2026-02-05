@@ -46,9 +46,32 @@ async def get_optimizations(
     """
     optimization_service = OptimizationService(db)
     return await optimization_service.get_suggestions(
-        project.id, 
-        days, 
-        include_low_priority=include_low_priority
+        project.id,
+        days,
+        include_low_priority=include_low_priority,
+        persist_recommendations=False,
+    )
+
+
+@router.post("/recommendations/generate", response_model=List[Dict[str, Any]])
+async def generate_recommendations(
+    days: int = Query(30, ge=1, le=90, description="Days of history to analyze"),
+    include_low_priority: bool = Query(True, description="Include low priority suggestions"),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_api_key),
+):
+    """
+    Generate optimization suggestions and persist top recommendations.
+    
+    This endpoint intentionally has side effects and should be called
+    explicitly by clients when they want new recommendations recorded.
+    """
+    optimization_service = OptimizationService(db)
+    return await optimization_service.get_suggestions(
+        project.id,
+        days,
+        include_low_priority=include_low_priority,
+        persist_recommendations=True,
     )
 
 
@@ -161,7 +184,7 @@ async def get_caching_opportunities(
     return {
         "opportunities": opportunities,
         "total_potential_monthly_savings": sum(
-            o.get("estimated_monthly_savings", 0) for o in opportunities
+            (o.get("estimated_monthly_savings") or 0) for o in opportunities
         ),
     }
 

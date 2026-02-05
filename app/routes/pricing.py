@@ -5,7 +5,8 @@ To sync pricing, call POST /v1/pricing/sync/litellm which fetches from:
 https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from datetime import datetime, timezone
@@ -14,8 +15,39 @@ from typing import Dict, Optional
 from ..database import get_db
 from ..models.db_models import ModelPricing
 from ..services.pricing_service import PricingService
+from ..services.auth_service import get_current_user
+from ..models.user_models import User
 
 router = APIRouter(prefix="/v1/pricing", tags=["Pricing"])
+security = HTTPBearer(auto_error=False)
+
+
+async def get_admin_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = await get_current_user(db, credentials.credentials)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+
+    return user
 
 
 # Fallback pricing when database is empty.
@@ -214,6 +246,7 @@ async def get_model_pricing(model_name: str, db: AsyncSession = Depends(get_db))
 async def update_pricing(
     pricing_updates: Dict[str, Dict[str, float]],
     db: AsyncSession = Depends(get_db),
+    _admin: User = Depends(get_admin_user),
 ):
     """Update pricing for models (Admin)."""
     updated_count = 0
@@ -253,6 +286,7 @@ async def sync_from_litellm(
     track_changes: bool = Query(False),
     auto_regenerate_alternatives: bool = Query(True, description="Automatically regenerate model alternatives after sync"),
     db: AsyncSession = Depends(get_db),
+    _admin: User = Depends(get_admin_user),
 ):
     """
     Sync pricing from LiteLLM database.
@@ -281,6 +315,7 @@ async def sync_from_litellm(
 async def sync_from_openrouter(
     auto_regenerate_alternatives: bool = Query(True, description="Automatically regenerate model alternatives after sync"),
     db: AsyncSession = Depends(get_db),
+    _admin: User = Depends(get_admin_user),
 ):
     """
     Sync pricing from OpenRouter API.
@@ -354,6 +389,7 @@ async def generate_alternatives(
     max_alternatives_per_model: int = Query(5, ge=1, le=20),
     min_savings_percent: float = Query(10.0, ge=0, le=100),
     db: AsyncSession = Depends(get_db),
+    _admin: User = Depends(get_admin_user),
 ):
     """
     Auto-generate model alternatives by analyzing pricing data.

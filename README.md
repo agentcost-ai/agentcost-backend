@@ -209,7 +209,6 @@ DATABASE_URL=sqlite+aiosqlite:///./test.db pytest tests/ -v
 - [ ] Enable monitoring (Prometheus)
 - [ ] Set up log aggregation
 
-See [PRODUCTION.md](../PRODUCTION.md) for detailed deployment guide.
 
 ## License
 

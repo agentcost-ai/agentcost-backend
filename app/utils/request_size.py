@@ -37,4 +37,15 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
             except ValueError:
                 pass  # Invalid content-length header, continue
         
+        # Fallback: if Content-Length is missing, read body to enforce limit
+        if request.method in {"POST", "PUT", "PATCH"} and not content_length:
+            body = await request.body()
+            if len(body) > max_size_bytes:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "detail": f"Request body too large. Maximum size is {settings.max_request_size_mb}MB."
+                    },
+                )
+
         return await call_next(request)

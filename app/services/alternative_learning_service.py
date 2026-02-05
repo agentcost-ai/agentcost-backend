@@ -28,14 +28,6 @@ class AlternativeLearningService:
     4. Returns alternatives ranked by learned effectiveness
     """
     
-    # Quality tier thresholds based on price ratio
-    TIER_THRESHOLDS = {
-        1: 0.8,   # Premium: 80-100% of source price
-        2: 0.5,   # High: 50-80% of source price  
-        3: 0.3,   # Medium: 30-50% of source price
-        4: 0.1,   # Budget: 10-30% of source price
-        5: 0.0,   # Economy: <10% of source price
-    }
     
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -118,9 +110,8 @@ class AlternativeLearningService:
                     if requires_function_calling and not cheaper.supports_function_calling:
                         continue
                     
-                    # Calculate price ratio and quality tier
+                    # Calculate price ratio (do not infer quality from price)
                     price_ratio = cheap_price / exp_price
-                    quality_tier = self._calculate_quality_tier(price_ratio)
                     
                     # Create or update alternative
                     is_new = await self._upsert_alternative(
@@ -129,7 +120,7 @@ class AlternativeLearningService:
                         source_provider=provider,
                         alternative_provider=cheaper.provider or provider,
                         price_ratio=price_ratio,
-                        quality_tier=quality_tier,
+                        quality_tier=None,
                         requires_vision=requires_vision,
                         requires_function_calling=requires_function_calling,
                         max_input_tokens=cheaper.max_tokens,
@@ -215,7 +206,6 @@ class AlternativeLearningService:
                     continue
                 
                 price_ratio = cheap_price / exp_price
-                quality_tier = self._calculate_quality_tier(price_ratio)
                 
                 is_new = await self._upsert_alternative(
                     source_model=expensive.model_name,
@@ -223,7 +213,7 @@ class AlternativeLearningService:
                     source_provider=expensive.provider,
                     alternative_provider=cheaper.provider,
                     price_ratio=price_ratio,
-                    quality_tier=quality_tier,
+                    quality_tier=None,
                     requires_vision=expensive.supports_vision or False,
                     requires_function_calling=expensive.supports_function_calling or False,
                     max_input_tokens=cheaper.max_tokens,
@@ -245,7 +235,7 @@ class AlternativeLearningService:
         source_provider: str,
         alternative_provider: str,
         price_ratio: float,
-        quality_tier: int,
+        quality_tier: Optional[int],
         requires_vision: bool,
         requires_function_calling: bool,
         max_input_tokens: Optional[int] = None,
@@ -291,11 +281,11 @@ class AlternativeLearningService:
             return True
     
     def _calculate_quality_tier(self, price_ratio: float) -> int:
-        """Calculate quality tier from price ratio."""
-        for tier, threshold in sorted(self.TIER_THRESHOLDS.items()):
-            if price_ratio >= threshold:
-                return tier
-        return 5  # Economy tier
+        """
+        Deprecated: Quality should not be inferred from price ratios.
+        Retained for backward compatibility only.
+        """
+        return 0
     
     async def update_from_recommendation_outcome(
         self,
@@ -465,7 +455,6 @@ class AlternativeLearningService:
         # 4. price_ratio ASC (lower = more savings)
         query = query.order_by(
             ModelAlternative.same_provider.desc(),
-            ModelAlternative.quality_tier.asc(),
             ModelAlternative.confidence_score.desc(),
             ModelAlternative.price_ratio.asc(),
         ).limit(max_results)

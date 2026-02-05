@@ -454,6 +454,8 @@ class PricingService:
         if use_learned:
             learned_alternatives = await self._get_learned_alternatives(
                 model=model,
+                avg_input_tokens=avg_input_tokens,
+                avg_output_tokens=avg_output_tokens,
                 requires_vision=requires_vision,
                 requires_function_calling=requires_function_calling,
                 same_provider_only=same_provider_only,
@@ -476,8 +478,8 @@ class PricingService:
                     total_savings = input_savings + output_savings
                     savings_pct = (total_savings / source_total_cost * 100) if source_total_cost > 0 else 0
                     
-                    # Quality impact from tier
-                    quality_impact = self._tier_to_quality_impact(alt.quality_tier)
+                    # Do not infer quality from price-based tiers
+                    quality_impact = None
                     
                     formatted.append({
                         "model": alt.alternative_model,
@@ -527,6 +529,8 @@ class PricingService:
     async def _get_learned_alternatives(
         self,
         model: str,
+        avg_input_tokens: Optional[int],
+        avg_output_tokens: Optional[int],
         requires_vision: bool,
         requires_function_calling: bool,
         same_provider_only: bool,
@@ -557,16 +561,32 @@ class PricingService:
         # 4. price_ratio ASC (lower = more savings)
         query = query.order_by(
             ModelAlternative.same_provider.desc(),
-            ModelAlternative.quality_tier.asc(),
             ModelAlternative.confidence_score.desc(),
             ModelAlternative.price_ratio.asc(),
         ).limit(max_results)
         
         result = await self.db.execute(query)
-        return result.scalars().all()
+        alternatives = result.scalars().all()
+
+        if avg_input_tokens is None and avg_output_tokens is None:
+            return alternatives
+
+        total_tokens = (avg_input_tokens or 0) + (avg_output_tokens or 0)
+        if total_tokens <= 0:
+            return alternatives
+
+        # Filter alternatives that cannot support observed token usage
+        filtered = [
+            alt for alt in alternatives
+            if not alt.max_input_tokens_threshold or alt.max_input_tokens_threshold >= total_tokens
+        ]
+
+        return filtered
     
     def _tier_to_quality_impact(self, tier: int) -> str:
         """Convert quality tier to impact string."""
+        if not tier:
+            return None
         if tier <= 2:
             return "minimal"
         elif tier <= 3:

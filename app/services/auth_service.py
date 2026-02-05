@@ -388,17 +388,30 @@ class AuthService:
         )
     
     async def logout_user(self, token: str) -> bool:
-        """Revoke a specific session by token"""
-        token_hash = hash_token(token)
-        
-        result = await self.db.execute(
-            update(UserSession)
-            .where(UserSession.token_hash == token_hash)
-            .values(is_revoked=True)
-        )
-        
-        await self.db.commit()
-        return result.rowcount > 0
+        """Revoke a specific session by refresh token, or all sessions for access tokens."""
+        payload = decode_token(token)
+        if not payload:
+            return False
+
+        token_type = payload.get("type")
+        if token_type == "refresh":
+            token_hash = hash_token(token)
+            result = await self.db.execute(
+                update(UserSession)
+                .where(UserSession.token_hash == token_hash)
+                .values(is_revoked=True)
+            )
+            await self.db.commit()
+            return result.rowcount > 0
+
+        if token_type == "access":
+            user_id = payload.get("sub")
+            if not user_id:
+                return False
+            revoked_count = await self.logout_all_sessions(user_id)
+            return revoked_count > 0
+
+        return False
     
     async def logout_all_sessions(self, user_id: str) -> int:
         """Revoke all sessions for a user"""
@@ -613,6 +626,7 @@ class AuthService:
         
         return TokenResponse(
             access_token=access_token,
+            refresh_token=refresh_token,
             token_type="bearer",
             expires_in=expires_in,
             user=UserResponse(

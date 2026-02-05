@@ -4,7 +4,7 @@ AgentCost Backend - Projects API Routes
 Endpoints for project management.
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional
@@ -15,6 +15,7 @@ from ..models.db_models import Project
 from ..models.user_models import User
 from ..services.event_service import ProjectService
 from ..services.auth_service import get_current_user
+from ..services.permission_service import PermissionService, Permission
 from ..utils.auth import validate_api_key, optional_api_key
 
 router = APIRouter(prefix="/v1/projects", tags=["Projects"])
@@ -34,6 +35,26 @@ async def get_optional_user(
         return await get_current_user(db, credentials.credentials)
     except Exception:
         return None
+
+
+async def get_required_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user = await get_current_user(db, credentials.credentials)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
 
 
 @router.post("")
@@ -66,6 +87,7 @@ async def create_project(
         "name": project.name,
         "description": project.description,
         "api_key": plaintext_api_key,  # Show ONCE, then never again
+        "key_prefix": plaintext_api_key[:8] if plaintext_api_key else None,
         "is_active": project.is_active,
         "created_at": project.created_at.isoformat() if project.created_at else None,
         "updated_at": project.updated_at.isoformat() if project.updated_at else None,
@@ -87,7 +109,8 @@ async def get_current_project(
         "id": project.id,
         "name": project.name,
         "description": project.description,
-        "api_key": "sk_***" + project.api_key[-8:] if len(project.api_key) > 8 else "sk_***",  # Masked
+        "api_key": None,
+        "key_prefix": None,
         "is_active": project.is_active,
         "created_at": project.created_at.isoformat() if project.created_at else None,
         "updated_at": project.updated_at.isoformat() if project.updated_at else None,
@@ -111,7 +134,15 @@ async def get_project(
             detail="Not authorized to access this project.",
         )
     
-    return auth_project
+    return {
+        "id": auth_project.id,
+        "name": auth_project.name,
+        "description": auth_project.description,
+        "api_key": None,
+        "key_prefix": None,
+        "is_active": auth_project.is_active,
+        "created_at": auth_project.created_at,
+    }
 
 
 @router.patch("/{project_id}", response_model=ProjectResponse)
@@ -141,7 +172,15 @@ async def update_project(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found.")
     
-    return project
+    return {
+        "id": project.id,
+        "name": project.name,
+        "description": project.description,
+        "api_key": None,
+        "key_prefix": None,
+        "is_active": project.is_active,
+        "created_at": project.created_at,
+    }
 
 
 @router.delete("/{project_id}")
@@ -168,3 +207,39 @@ async def delete_project(
         raise HTTPException(status_code=404, detail="Project not found.")
     
     return {"status": "deleted"}
+
+
+@router.post("/{project_id}/api-key/rotate")
+async def rotate_api_key(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    user: User = Depends(get_required_user),
+):
+    """
+    Rotate the project's API key.
+
+    Returns the new API key ONCE. Requires regenerate_api_key permission.
+    """
+    permission_service = PermissionService(db)
+    try:
+        await permission_service.require_permission(
+            user.id, project_id, Permission.REGENERATE_API_KEY
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+    project_service = ProjectService(db)
+    result = await project_service.regenerate_api_key(project_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    project, plaintext_key = result
+    await db.commit()
+
+    return {
+        "status": "ok",
+        "project_id": project.id,
+        "api_key": plaintext_key,
+        "key_prefix": plaintext_key[:8] if plaintext_key else None,
+        "message": "Save this API key now. It cannot be retrieved later.",
+    }

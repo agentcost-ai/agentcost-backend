@@ -38,6 +38,8 @@ class EventService:
         
         db_events = []
         pattern_service = PatternAnalysisService(self.db)
+        from .pricing_service import PricingService
+        pricing_service = PricingService(self.db)
         
         for event_data in events:
             # Parse timestamp
@@ -45,14 +47,21 @@ class EventService:
                 event_data.timestamp.replace('Z', '+00:00')
             )
             
+            total_tokens = event_data.input_tokens + event_data.output_tokens
+            calculated_cost = await pricing_service.calculate_cost(
+                event_data.model,
+                event_data.input_tokens,
+                event_data.output_tokens,
+            )
+
             db_event = Event(
                 project_id=project_id,
                 agent_name=event_data.agent_name,
                 model=event_data.model,
                 input_tokens=event_data.input_tokens,
                 output_tokens=event_data.output_tokens,
-                total_tokens=event_data.total_tokens,
-                cost=event_data.cost,
+                total_tokens=total_tokens,
+                cost=calculated_cost,
                 latency_ms=event_data.latency_ms,
                 timestamp=timestamp,
                 success=event_data.success,
@@ -68,11 +77,12 @@ class EventService:
                     project_id=project_id,
                     agent_name=event_data.agent_name,
                     input_hash=event_data.input_hash,
-                    cost=event_data.cost,
+                    cost=calculated_cost,
                 )
         
         self.db.add_all(db_events)
         await self.db.commit()  # Commit without needing IDs back
+        await pricing_service.close()
         
         return len(db_events)
     
@@ -210,6 +220,24 @@ class ProjectService:
         
         await self.db.flush()
         return project
+
+    async def regenerate_api_key(self, project_id: str) -> Optional[tuple]:
+        """
+        Regenerate a project's API key.
+
+        Returns:
+            Tuple of (project, plaintext_api_key)
+        """
+        from ..utils.auth import generate_secure_api_key
+
+        project = await self.get_by_id(project_id)
+        if not project:
+            return None
+
+        plaintext_key, hashed_key = generate_secure_api_key()
+        project.api_key = hashed_key
+        await self.db.flush()
+        return project, plaintext_key
     
     async def delete(self, project_id: str) -> bool:
         """Delete project"""

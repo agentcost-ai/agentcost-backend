@@ -416,7 +416,7 @@ class PatternAnalysisService:
             )
             self.db.add(pattern)
         
-        await self.db.commit()
+        await self.db.flush()
     
     async def analyze_caching_opportunities(
         self,
@@ -449,6 +449,8 @@ class PatternAnalysisService:
                     else_=0
                 )
             ).label('potential_savings'),
+            func.min(InputPatternCache.first_seen_at).label('first_seen'),
+            func.max(InputPatternCache.last_seen_at).label('last_seen'),
         ).where(
             InputPatternCache.project_id == project_id
         ).group_by(
@@ -473,14 +475,27 @@ class PatternAnalysisService:
             unique_patterns = int(row.unique_patterns) if row.unique_patterns is not None else 0
             total_cost = float(row.total_cost) if row.total_cost is not None else 0.0
             potential_savings = float(row.potential_savings) if row.potential_savings is not None else 0.0
+            first_seen = row.first_seen
+            last_seen = row.last_seen
             
             if total_calls == 0:
                 continue
             
             duplicate_rate = duplicate_calls / total_calls
-            monthly_savings = potential_savings * 30 / 7  # Extrapolate to monthly
-            
-            if monthly_savings < min_savings:
+            monthly_savings = None
+            savings_estimated = False
+            coverage_days = None
+
+            if first_seen and last_seen:
+                coverage_days = max(1, (last_seen - first_seen).days + 1)
+                if coverage_days >= 7:
+                    monthly_savings = (potential_savings / coverage_days) * 30
+                else:
+                    savings_estimated = True
+            else:
+                savings_estimated = True
+
+            if monthly_savings is not None and monthly_savings < min_savings:
                 continue
             
             opportunities.append({
@@ -491,7 +506,9 @@ class PatternAnalysisService:
                 "duplicate_rate": round(duplicate_rate * 100, 1),
                 "total_cost": round(total_cost, 4),
                 "potential_savings": round(potential_savings, 4),
-                "estimated_monthly_savings": round(monthly_savings, 2),
+                "estimated_monthly_savings": round(monthly_savings, 2) if monthly_savings is not None else None,
+                "savings_estimated": savings_estimated,
+                "coverage_days": coverage_days,
             })
         
         opportunities.sort(key=lambda x: x["estimated_monthly_savings"], reverse=True)

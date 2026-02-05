@@ -154,7 +154,8 @@ class ProjectResponse(BaseModel):
     id: str
     name: str
     description: Optional[str] = None
-    api_key: str
+    api_key: Optional[str] = None
+    key_prefix: Optional[str] = None
     is_active: bool
     created_at: datetime
     
