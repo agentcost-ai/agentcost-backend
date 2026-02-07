@@ -4,9 +4,10 @@ AgentCost Backend - Pydantic Schemas
 Request/Response models for API validation.
 """
 
-from pydantic import BaseModel, Field, field_validator, ConfigDict
-from typing import Optional, List, Dict, Any
+from pydantic import BaseModel, Field, field_validator, ConfigDict, EmailStr
+from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime, timezone
+from pydantic import model_validator
 
 
 class EventCreate(BaseModel):
@@ -176,3 +177,131 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     version: str
     timestamp: str
+
+
+FeedbackType = Literal[
+    "feature_request",
+    "bug_report",
+    "model_request",
+    "general",
+    "security_report",
+    "performance_issue",
+]
+FeedbackStatus = Literal[
+    "open",
+    "under_review",
+    "needs_info",
+    "in_progress",
+    "completed",
+    "shipped",
+    "rejected",
+    "duplicate",
+]
+FeedbackPriority = Literal["low", "medium", "high", "critical"]
+
+
+class FeedbackCreate(BaseModel):
+    """Submit feedback or a request."""
+
+    type: FeedbackType
+    title: str = Field(..., min_length=3, max_length=255)
+    description: str = Field(..., min_length=10, max_length=5000)
+    model_name: Optional[str] = Field(None, max_length=255)
+    model_provider: Optional[str] = Field(None, max_length=100)
+    user_email: Optional[EmailStr] = Field(None, max_length=255)
+    user_name: Optional[str] = Field(None, max_length=255)
+
+    # Type-specific structured data stored as JSON
+    metadata: Optional[Dict[str, Any]] = None
+    # Attachment references (list of {url, name?, size?, type?})
+    attachments: Optional[List[Dict[str, Any]]] = None
+    # Environment context (production, staging, development)
+    environment: Optional[str] = Field(None, max_length=50)
+    # Client metadata (SDK version, OS, browser)
+    client_metadata: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def validate_model_request(self):
+        if self.type == "model_request" and not (self.model_name or self.model_provider):
+            raise ValueError("Model requests should include a model name or provider")
+        return self
+
+
+class FeedbackUpdate(BaseModel):
+    """Admin update payload for feedback status and response."""
+
+    status: FeedbackStatus
+    priority: Optional[FeedbackPriority] = None
+    admin_response: Optional[str] = Field(None, max_length=5000)
+
+
+class FeedbackResponse(BaseModel):
+    id: str
+    type: FeedbackType
+    title: str
+    description: str
+    status: FeedbackStatus
+    priority: FeedbackPriority
+    upvotes: int
+    user_has_upvoted: bool
+    model_name: Optional[str]
+    model_provider: Optional[str]
+    admin_response: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    comment_count: int
+    user_name: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+    attachments: Optional[List[Dict[str, Any]]] = None
+    environment: Optional[str] = None
+    is_confidential: bool = False
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class FeedbackListResponse(BaseModel):
+    items: List[FeedbackResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class FeedbackSummaryResponse(BaseModel):
+    total: int
+    by_type: Dict[str, int]
+    by_status: Dict[str, int]
+
+
+class FeedbackCreatedResponse(BaseModel):
+    id: str
+    message: str
+
+
+class FeedbackCommentCreate(BaseModel):
+    comment: str = Field(..., min_length=1, max_length=2000)
+    user_name: Optional[str] = Field(None, max_length=255)
+
+
+class FeedbackCommentResponse(BaseModel):
+    id: str
+    user_name: Optional[str]
+    comment: str
+    is_admin: bool
+    created_at: datetime
+
+
+class FeedbackCommentListResponse(BaseModel):
+    items: List[FeedbackCommentResponse]
+    total: int
+
+
+class FeedbackEventResponse(BaseModel):
+    """Audit trail event for a feedback item."""
+
+    id: str
+    feedback_id: str
+    event_type: str
+    old_value: Optional[Dict[str, Any]] = None
+    new_value: Optional[Dict[str, Any]] = None
+    actor_id: Optional[str] = None
+    created_at: datetime

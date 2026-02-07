@@ -9,6 +9,8 @@ from typing import Optional, List
 from datetime import datetime
 import re
 
+from ..common import validate_password_strength
+
 
 #  Policy Consent 
 
@@ -63,15 +65,7 @@ class UserRegister(BaseModel):
     @classmethod
     def validate_password(cls, v):
         """Ensure password meets security requirements"""
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters')
-        if not re.search(r'[A-Z]', v):
-            raise ValueError('Password must contain at least one uppercase letter')
-        if not re.search(r'[a-z]', v):
-            raise ValueError('Password must contain at least one lowercase letter')
-        if not re.search(r'[0-9]', v):
-            raise ValueError('Password must contain at least one number')
-        return v
+        return validate_password_strength(v)
     
     @field_validator('accept_terms', 'accept_privacy')
     @classmethod
@@ -143,15 +137,7 @@ class PasswordChangeRequest(BaseModel):
     @field_validator('new_password')
     @classmethod
     def validate_password(cls, v):
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters')
-        if not re.search(r'[A-Z]', v):
-            raise ValueError('Password must contain at least one uppercase letter')
-        if not re.search(r'[a-z]', v):
-            raise ValueError('Password must contain at least one lowercase letter')
-        if not re.search(r'[0-9]', v):
-            raise ValueError('Password must contain at least one number')
-        return v
+        return validate_password_strength(v)
 
 
 class PasswordResetRequest(BaseModel):
@@ -169,15 +155,7 @@ class PasswordResetConfirm(BaseModel):
     @field_validator('new_password')
     @classmethod
     def validate_password(cls, v):
-        if len(v) < 8:
-            raise ValueError('Password must be at least 8 characters')
-        if not re.search(r'[A-Z]', v):
-            raise ValueError('Password must contain at least one uppercase letter')
-        if not re.search(r'[a-z]', v):
-            raise ValueError('Password must contain at least one lowercase letter')
-        if not re.search(r'[0-9]', v):
-            raise ValueError('Password must contain at least one number')
-        return v
+        return validate_password_strength(v)
 
 
 #  Email Verification 

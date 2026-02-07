@@ -1,19 +1,32 @@
 # AgentCost Backend - Main Application
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone
 
 from .config import get_settings
 from .database import create_tables, get_db_session
-from .routes import events_router, analytics_router, projects_router, optimizations_router, pricing_router
+from .routes import (
+    events_router,
+    analytics_router,
+    projects_router,
+    optimizations_router,
+    pricing_router,
+    feedback_router,
+    attachments_router,
+)
 from .routes.auth import router as auth_router
 from .routes.members import router as members_router
 from .models.schemas import HealthResponse
 from .utils.rate_limiter import RateLimitMiddleware
 from .utils.request_size import RequestSizeLimitMiddleware
 from .services.pricing_service import PricingService
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -22,28 +35,36 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     """Application lifespan events"""
     # Startup
-    print("Starting AgentCost Backend...")
+    logger.info("Starting AgentCost Backend...")
     await create_tables()
-    print("Database tables created")
+    logger.info("Database tables created")
+    
+    # Create upload directory if missing
+    upload_dir = Path(settings.upload_dir).resolve()
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    logger.info("Upload directory: %s", upload_dir)
     
     # Optional: Auto-sync pricing on startup
     if settings.auto_sync_pricing_on_startup:
-        print("Auto-syncing pricing from LiteLLM...")
+        logger.info("Auto-syncing pricing from LiteLLM...")
         try:
             async for db in get_db_session():
                 pricing_service = PricingService(db)
                 result = await pricing_service.sync_from_litellm(track_changes=False)
                 await pricing_service.close()
-                print(f"Pricing sync complete: {result.get('models_created', 0)} created, "
-                      f"{result.get('models_updated', 0)} updated")
+                logger.info(
+                    "Pricing sync complete: %d created, %d updated",
+                    result.get('models_created', 0),
+                    result.get('models_updated', 0),
+                )
                 break
         except Exception as e:
-            print(f"Warning: Pricing sync failed: {e}")
+            logger.warning("Pricing sync failed: %s", e)
     
     yield
     
     # Shutdown
-    print("Shutting down AgentCost Backend...")
+    logger.info("Shutting down AgentCost Backend...")
 
 
 # Create FastAPI app
@@ -77,6 +98,8 @@ app.include_router(analytics_router)
 app.include_router(projects_router)
 app.include_router(optimizations_router)
 app.include_router(pricing_router)
+app.include_router(feedback_router)
+app.include_router(attachments_router)
 
 
 @app.get("/v1/health", response_model=HealthResponse, tags=["Health"])

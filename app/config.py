@@ -80,6 +80,18 @@ class Settings(BaseSettings):
     resend_sender_email: str = "noreply@agentcost.dev"
     resend_sender_name: str = "AgentCost"
     frontend_url: str = "http://localhost:3000"
+    feedback_admin_email: str = ""
+    
+    # Attachment storage
+    # Directory for uploaded files. Use an absolute path outside the project
+    # root in production (e.g. /var/app_data/uploads).
+    upload_dir: str = "uploads"
+    # Max file size in bytes (default 10 MB)
+    max_upload_size: int = 10 * 1024 * 1024
+    # Max number of files per single feedback submission
+    max_attachments_per_feedback: int = 3
+    # Storage backend: "local" today, swap to "s3" later without schema changes
+    storage_backend: str = "local"
     
     # Legal Policy Versions
     # IMPORTANT: Increment these when policies are updated

@@ -14,10 +14,7 @@ from datetime import datetime
 import uuid
 
 from ..database import Base
-
-
-def generate_uuid():
-    return str(uuid.uuid4())
+from ..common import generate_uuid
 
 
 def generate_api_key():
@@ -376,3 +373,131 @@ class InputPatternCache(Base):
     
     def __repr__(self):
         return f"<InputPatternCache {self.agent_name} - {self.occurrence_count} occurrences>"
+
+
+class Feedback(Base):
+    """
+    User feedback and requests.
+
+    Supports feature requests, bug reports, model requests, and general feedback.
+    """
+
+    __tablename__ = "feedback"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    user_email = Column(String(255), nullable=True)
+    user_name = Column(String(255), nullable=True)
+
+    type = Column(String(50), nullable=False)
+    title = Column(String(255), nullable=False)
+    description = Column(Text, nullable=False)
+
+    model_name = Column(String(255), nullable=True)
+    model_provider = Column(String(100), nullable=True)
+
+    # Mapped to column "metadata" in the DB; attribute renamed to dodge
+    # SQLAlchemy's reserved Base.metadata namespace.
+    type_metadata = Column("metadata", JSON, nullable=True)
+    attachments = Column(JSON, nullable=True)
+    environment = Column(String(50), nullable=True)  # e.g. production, staging, local
+    client_metadata = Column(JSON, nullable=True)     # SDK version, OS, browser, etc.
+    is_confidential = Column(Boolean, default=False, nullable=False)
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(Text, nullable=True)
+
+    status = Column(String(50), default="open", nullable=False)
+    priority = Column(String(50), default="medium", nullable=False)
+
+    upvotes = Column(Integer, default=0, nullable=False)
+
+    admin_response = Column(Text, nullable=True)
+    admin_responded_at = Column(DateTime(timezone=True), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    comments = relationship("FeedbackComment", back_populates="feedback", cascade="all, delete-orphan")
+    upvote_entries = relationship("FeedbackUpvote", back_populates="feedback", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_feedback_type", "type"),
+        Index("idx_feedback_status", "status"),
+        Index("idx_feedback_priority", "priority"),
+        Index("idx_feedback_created", "created_at"),
+        Index("idx_feedback_upvotes", "upvotes"),
+        Index("idx_feedback_user", "user_id"),
+    )
+
+    def __repr__(self):
+        return f"<Feedback {self.type} - {self.title[:30]}>"
+
+
+class FeedbackUpvote(Base):
+    """Tracks upvotes for feedback items (prevents duplicates)."""
+
+    __tablename__ = "feedback_upvotes"
+
+    feedback_id = Column(String(36), ForeignKey("feedback.id", ondelete="CASCADE"), primary_key=True)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    feedback = relationship("Feedback", back_populates="upvote_entries")
+
+    __table_args__ = (
+        Index("idx_feedback_upvotes_user", "user_id"),
+    )
+
+
+class FeedbackComment(Base):
+    """Comments on feedback items."""
+
+    __tablename__ = "feedback_comments"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+
+    feedback_id = Column(String(36), ForeignKey("feedback.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    user_name = Column(String(255), nullable=True)
+
+    comment = Column(Text, nullable=False)
+    is_admin = Column(Boolean, default=False)
+    is_internal = Column(Boolean, default=False)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    feedback = relationship("Feedback", back_populates="comments")
+
+    __table_args__ = (
+        Index("idx_feedback_comments_feedback", "feedback_id", "created_at"),
+    )
+
+
+class FeedbackEvent(Base):
+    """
+    Audit trail for feedback lifecycle changes.
+
+    Every status change, priority change, or admin action emits
+    an immutable event record for full traceability.
+    """
+
+    __tablename__ = "feedback_events"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    feedback_id = Column(String(36), ForeignKey("feedback.id", ondelete="CASCADE"), nullable=False)
+
+    event_type = Column(String(50), nullable=False)  # status_change, priority_change, admin_note
+    old_value = Column(JSON, nullable=True)
+    new_value = Column(JSON, nullable=True)
+    actor_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_feedback_events_feedback", "feedback_id", "created_at"),
+    )
+
+    def __repr__(self):
+        return f"<FeedbackEvent {self.event_type} on {self.feedback_id}>"

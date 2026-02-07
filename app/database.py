@@ -4,12 +4,16 @@ AgentCost Backend - Database Setup
 SQLAlchemy async database configuration.
 """
 
+import logging
+
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import MetaData
+from sqlalchemy import MetaData, text, inspect
 from typing import AsyncGenerator
 
 from .config import get_settings
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -77,6 +81,71 @@ async def create_tables():
     """Create all tables (for development)"""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Apply column-level migrations for existing tables
+        await _apply_column_migrations(conn)
+
+
+async def _apply_column_migrations(conn):
+    """
+    Patch existing tables with any columns the models define but the DB lacks.
+
+    create_all() only creates new tables -- it won't ALTER existing ones.
+    This introspects the live schema and issues ALTER TABLE ADD COLUMN
+    for each missing column.  Works for both PostgreSQL and SQLite.
+    """
+    def _get_missing_columns(sync_conn):
+        insp = inspect(sync_conn)
+        migrations = []
+
+        desired = {
+            "feedback": {
+                "metadata":        {"type": "JSON"},
+                "attachments":     {"type": "JSON"},
+                "environment":     {"type": "VARCHAR(50)"},
+                "client_metadata": {"type": "JSON"},
+                "is_confidential": {"type": "BOOLEAN", "default": "false", "nullable": False},
+                "ip_address":      {"type": "VARCHAR(45)"},
+                "user_agent":      {"type": "TEXT"},
+            },
+            "feedback_comments": {
+                "is_internal": {"type": "BOOLEAN", "default": "false"},
+            },
+        }
+
+        for table_name, columns in desired.items():
+            if not insp.has_table(table_name):
+                continue
+            existing = {col["name"] for col in insp.get_columns(table_name)}
+            for col_name, spec in columns.items():
+                if col_name not in existing:
+                    migrations.append((table_name, col_name, spec))
+
+        return migrations
+
+    missing = await conn.run_sync(_get_missing_columns)
+
+    if missing:
+        # Detect dialect for boolean default syntax
+        is_sqlite = "sqlite" in settings.database_url
+
+        for table_name, col_name, spec in missing:
+            col_type = spec["type"]
+            default = spec.get("default")
+            nullable = spec.get("nullable", True)
+
+            # SQLite uses 0/1 for booleans, PostgreSQL uses true/false
+            if default is not None and col_type == "BOOLEAN" and is_sqlite:
+                default = "0" if default == "false" else "1"
+
+            parts = [f"ALTER TABLE {table_name} ADD COLUMN {col_name} {col_type}"]
+            if default is not None:
+                parts.append(f"DEFAULT {default}")
+            if not nullable:
+                parts.append("NOT NULL")
+
+            stmt = " ".join(parts)
+            logger.info("Migration: %s", stmt)
+            await conn.execute(text(stmt))
 
 
 async def drop_tables():

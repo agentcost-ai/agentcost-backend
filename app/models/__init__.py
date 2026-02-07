@@ -13,6 +13,10 @@ from .db_models import (
     OptimizationRecommendation,
     ProjectBaseline,
     InputPatternCache,
+    Feedback,
+    FeedbackUpvote,
+    FeedbackComment,
+    FeedbackEvent,
 )
 from .user_models import User, UserSession, ProjectMember, UserRole
 from .schemas import (
@@ -29,6 +33,12 @@ from .schemas import (
     ProjectResponse,
     ProjectUpdate,
     HealthResponse,
+    FeedbackCreate,
+    FeedbackUpdate,
+    FeedbackResponse,
+    FeedbackListResponse,
+    FeedbackSummaryResponse,
+    FeedbackEventResponse,
 )
 from .auth_schemas import (
     UserRegister,
@@ -52,6 +62,10 @@ __all__ = [
     "Project",
     "Event",
     "DailyAggregate",
+    "Feedback",
+    "FeedbackUpvote",
+    "FeedbackComment",
+    "FeedbackEvent",
     
     # User models
     "User",
@@ -92,6 +106,14 @@ __all__ = [
     "ProjectMemberCreate",
     "ProjectMemberResponse",
     "ProjectMemberUpdate",
+    
+    # Feedback schemas
+    "FeedbackCreate",
+    "FeedbackUpdate",
+    "FeedbackResponse",
+    "FeedbackListResponse",
+    "FeedbackSummaryResponse",
+    "FeedbackEventResponse",
     
     # Health
     "HealthResponse",

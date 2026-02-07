@@ -7,6 +7,8 @@ from .analytics import router as analytics_router
 from .projects import router as projects_router
 from .optimizations import router as optimizations_router
 from .pricing import router as pricing_router
+from .feedback import router as feedback_router
+from .attachments import router as attachments_router
 
 __all__ = [
     "events_router",
@@ -14,4 +16,6 @@ __all__ = [
     "projects_router",
     "optimizations_router",
     "pricing_router",
+    "feedback_router",
+    "attachments_router",
 ]

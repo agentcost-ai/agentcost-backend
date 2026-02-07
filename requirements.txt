@@ -21,6 +21,9 @@ passlib[bcrypt]>=1.7.4
 # Email
 resend>=2.0.0
 
+# File storage
+aiofiles>=23.2.0
+
 # Utilities
 python-dotenv>=1.0.0
 

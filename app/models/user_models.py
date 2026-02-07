@@ -11,14 +11,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from datetime import datetime
-import uuid
 import enum
 
 from ..database import Base
-
-
-def generate_uuid():
-    return str(uuid.uuid4())
+from ..common import generate_uuid
 
 
 class UserRole(str, enum.Enum):
