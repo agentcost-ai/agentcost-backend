@@ -11,6 +11,7 @@ from .invitation import get_invitation_email_html
 from .invitation_new_user import get_new_user_invitation_email_html
 from .feedback_admin import get_feedback_admin_email_html
 from .feedback_update import get_feedback_update_email_html
+from .admin_direct import get_admin_direct_email_html
 
 __all__ = [
     "get_verification_email_html",
@@ -19,4 +20,5 @@ __all__ = [
     "get_new_user_invitation_email_html",
     "get_feedback_admin_email_html",
     "get_feedback_update_email_html",
+    "get_admin_direct_email_html",
 ]

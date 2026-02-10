@@ -16,6 +16,7 @@ from .email_templates import (
     get_new_user_invitation_email_html,
     get_feedback_admin_email_html,
     get_feedback_update_email_html,
+    get_admin_direct_email_html,
 )
 
 settings = get_settings()
@@ -168,3 +169,14 @@ async def send_feedback_update_email(
         link=link,
     )
     return _send(email, "Your feedback has been updated", html)
+
+
+def send_admin_email(to: str, subject: str, body: str) -> bool:
+    """
+    Send a direct email from the admin panel.
+
+    Public wrapper around ``_send`` that applies the standard admin
+    email template so callers do not need to construct raw HTML.
+    """
+    html = get_admin_direct_email_html(body)
+    return _send(to, subject, html)

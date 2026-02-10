@@ -98,6 +98,9 @@ async def _apply_column_migrations(conn):
         migrations = []
 
         desired = {
+            "users": {
+                "admin_notes": {"type": "TEXT"},
+            },
             "feedback": {
                 "metadata":        {"type": "JSON"},
                 "attachments":     {"type": "JSON"},

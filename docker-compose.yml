@@ -9,6 +9,10 @@ services:
       - DATABASE_URL=sqlite+aiosqlite:///./agentcost.db
       - SECRET_KEY=your-secret-key-change-in-production
       - DEBUG=true
+      # Initial admin account — created automatically on first startup
+      - ADMIN_EMAIL=admin@agentcost.dev
+      - ADMIN_PASSWORD=ChangeMe!2024
+      - ADMIN_NAME=Admin
     volumes:
       - ./data:/app/data
     restart: unless-stopped

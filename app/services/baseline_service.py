@@ -11,7 +11,7 @@ from decimal import Decimal
 from enum import Enum
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, case, text
-from sqlalchemy.orm import selectinload
+
 
 from ..models.db_models import (
     Event, 

@@ -19,12 +19,14 @@ from .routes import (
 )
 from .routes.auth import router as auth_router
 from .routes.members import router as members_router
+from .routes.admin import router as admin_router
 from .models.schemas import HealthResponse
 from .utils.rate_limiter import RateLimitMiddleware
 from .utils.request_size import RequestSizeLimitMiddleware
 from .services.pricing_service import PricingService
 
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,45 @@ async def lifespan(app: FastAPI):
                 break
         except Exception as e:
             logger.warning("Pricing sync failed: %s", e)
+    
+    # Auto-seed superuser from environment variables (for Docker / first-time setup)
+    admin_email = os.getenv("ADMIN_EMAIL", "").strip()
+    admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
+    if admin_email and admin_password:
+        try:
+            from sqlalchemy import select
+            from .models.user_models import User
+            from .services.auth_service import hash_password
+
+            async for db in get_db_session():
+                existing = (await db.execute(
+                    select(User).where(User.email == admin_email.lower())
+                )).scalar_one_or_none()
+
+                if existing:
+                    if not existing.is_superuser:
+                        existing.is_superuser = True
+                        existing.is_active = True
+                        await db.commit()
+                        logger.info("Existing user %s promoted to superuser", admin_email)
+                    else:
+                        logger.info("Superuser %s already exists", admin_email)
+                else:
+                    admin_name = os.getenv("ADMIN_NAME", "Admin").strip()
+                    user = User(
+                        email=admin_email.lower(),
+                        password_hash=hash_password(admin_password),
+                        name=admin_name,
+                        is_superuser=True,
+                        is_active=True,
+                        email_verified=True,
+                    )
+                    db.add(user)
+                    await db.commit()
+                    logger.info("Superuser %s created from environment variables", admin_email)
+                break
+        except Exception as e:
+            logger.warning("Admin auto-seed failed: %s", e)
     
     yield
     
@@ -100,6 +141,7 @@ app.include_router(optimizations_router)
 app.include_router(pricing_router)
 app.include_router(feedback_router)
 app.include_router(attachments_router)
+app.include_router(admin_router)
 
 
 @app.get("/v1/health", response_model=HealthResponse, tags=["Health"])

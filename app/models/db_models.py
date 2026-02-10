@@ -501,3 +501,37 @@ class FeedbackEvent(Base):
 
     def __repr__(self):
         return f"<FeedbackEvent {self.event_type} on {self.feedback_id}>"
+
+
+class AdminActivityLog(Base):
+    """
+    Immutable audit trail for all admin-initiated actions.
+
+    Every admin operation (user toggle, project freeze, feedback update,
+    key rotation, email dispatch, etc.) is recorded here for compliance
+    and operational visibility.
+    """
+
+    __tablename__ = "admin_activity_log"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    admin_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+
+    action_type = Column(String(100), nullable=False)  # e.g. user_disabled, project_frozen, feedback_updated
+    target_type = Column(String(50), nullable=True)     # user, project, feedback, system
+    target_id = Column(String(36), nullable=True)
+
+    details = Column(JSON, nullable=True)  # Serialized change details
+    ip_address = Column(String(45), nullable=True)
+    user_agent = Column(Text, nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_admin_log_admin", "admin_id", "created_at"),
+        Index("idx_admin_log_action", "action_type", "created_at"),
+        Index("idx_admin_log_target", "target_type", "target_id"),
+    )
+
+    def __repr__(self):
+        return f"<AdminActivityLog {self.action_type} by {self.admin_id}>"
