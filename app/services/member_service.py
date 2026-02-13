@@ -122,7 +122,7 @@ class MemberService:
         
         try:
             self.db.add(membership)
-            await self.db.commit()
+            await self.db.flush()
             await self.db.refresh(membership)
             return membership, None, False  # Not a new user
         except IntegrityError:
@@ -163,7 +163,7 @@ class MemberService:
         
         try:
             self.db.add(pending)
-            await self.db.commit()
+            await self.db.flush()
             await self.db.refresh(pending)
             return pending, None, True  # Is a new user (not registered)
         except IntegrityError:
@@ -226,7 +226,7 @@ class MemberService:
             await self.db.delete(pending)
         
         if memberships_to_add or invitations_to_delete:
-            await self.db.commit()
+            await self.db.flush()
         
         return processed
     
@@ -257,7 +257,7 @@ class MemberService:
             return None, "No pending invitation found"
         
         membership.accepted_at = datetime.now(timezone.utc)
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(membership)
         
         return membership, None
@@ -289,7 +289,7 @@ class MemberService:
             return False, "No pending invitation found"
         
         await self.db.delete(membership)
-        await self.db.commit()
+        await self.db.flush()
         
         return True, None
     
@@ -353,7 +353,7 @@ class MemberService:
             return None, "User is not a member of this project"
         
         membership.role = parsed_role.value
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(membership)
         
         return membership, None
@@ -422,7 +422,7 @@ class MemberService:
             for pending in pending_invitations:
                 await self.db.delete(pending)
         
-        await self.db.commit()
+        await self.db.flush()
         
         return True, None
     
@@ -465,7 +465,7 @@ class MemberService:
             return False, "You are not a member of this project"
         
         await self.db.delete(membership)
-        await self.db.commit()
+        await self.db.flush()
         
         return True, None
     

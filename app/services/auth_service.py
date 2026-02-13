@@ -270,7 +270,7 @@ class AuthService:
             user_agent=user_agent,
         )
         self.db.add(consent)
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(consent)
         return consent
     
@@ -389,7 +389,7 @@ class AuthService:
         
         user.last_login_at = datetime.now(timezone.utc)
         
-        await self.db.commit()
+        await self.db.flush()
         
         expires_in = int((access_expires - datetime.now(timezone.utc)).total_seconds())
         
@@ -424,7 +424,7 @@ class AuthService:
                 .where(UserSession.token_hash == token_hash)
                 .values(is_revoked=True)
             )
-            await self.db.commit()
+            await self.db.flush()
             return result.rowcount > 0
 
         if token_type == "access":
@@ -447,7 +447,7 @@ class AuthService:
             .values(is_revoked=True)
         )
         
-        await self.db.commit()
+        await self.db.flush()
         return result.rowcount
     
     async def verify_email(self, token: str) -> Optional[User]:
@@ -467,7 +467,7 @@ class AuthService:
         user.email_verified = True
         user.email_verification_token = None
         
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(user)
         
         return user
@@ -482,7 +482,7 @@ class AuthService:
         new_token = generate_verification_token()
         user.email_verification_token = hash_token(new_token)
         
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(user)
         
         return new_token
@@ -503,7 +503,7 @@ class AuthService:
         user.password_reset_token = hash_token(token)
         user.password_reset_expires = datetime.now(timezone.utc) + timedelta(hours=24)
         
-        await self.db.commit()
+        await self.db.flush()
         
         return token
     
@@ -527,7 +527,7 @@ class AuthService:
         
         await self.logout_all_sessions(user.id)
         
-        await self.db.commit()
+        await self.db.flush()
         return True
     
     async def change_password(
@@ -547,7 +547,7 @@ class AuthService:
         
         user.password_hash = hash_password(new_password)
         
-        await self.db.commit()
+        await self.db.flush()
         return True
     
     async def update_profile(
@@ -566,7 +566,7 @@ class AuthService:
         if data.avatar_url is not None:
             user.avatar_url = data.avatar_url
         
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(user)
         
         return user
@@ -596,7 +596,7 @@ class AuthService:
             .values(is_revoked=True)
         )
         
-        await self.db.commit()
+        await self.db.flush()
         return result.rowcount > 0
     
     async def refresh_session(
@@ -645,7 +645,7 @@ class AuthService:
             email=user.email
         )
         
-        await self.db.commit()
+        await self.db.flush()
         
         expires_in = int((access_expires - datetime.now(timezone.utc)).total_seconds())
         

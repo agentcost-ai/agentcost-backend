@@ -248,7 +248,7 @@ class PricingService:
                 self.db.add(new_pricing)
                 created_count += 1
         
-        await self.db.commit()
+        await self.db.flush()
         
         result = {
             "status": "ok",
@@ -325,7 +325,7 @@ class PricingService:
                 self.db.add(new_pricing)
                 created_count += 1
         
-        await self.db.commit()
+        await self.db.flush()
         
         return {
             "status": "ok",

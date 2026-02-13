@@ -184,7 +184,7 @@ class BaselineService:
             
             baselines_updated += 1
         
-        await self.db.commit()
+        await self.db.flush()
         
         return {
             "status": "ok",
@@ -609,7 +609,7 @@ class RecommendationTrackingService:
             existing_pending.estimated_savings_percent = estimated_savings_percent
             existing_pending.metrics_snapshot = safe_metrics
             existing_pending.expires_at = datetime.now(timezone.utc) + timedelta(days=expires_days)
-            await self.db.commit()
+            await self.db.flush()
             return existing_pending
         
         # Check for recently dismissed recommendation - don't recreate within cooldown
@@ -660,7 +660,7 @@ class RecommendationTrackingService:
         )
         
         self.db.add(recommendation)
-        await self.db.commit()
+        await self.db.flush()
         await self.db.refresh(recommendation)
         
         return recommendation
@@ -681,7 +681,7 @@ class RecommendationTrackingService:
         if recommendation:
             recommendation.status = "implemented"
             recommendation.implemented_at = datetime.now(timezone.utc)
-            await self.db.commit()
+            await self.db.flush()
             
             # Trigger learning for model alternatives
             if recommendation.model and recommendation.alternative_model:
@@ -714,7 +714,7 @@ class RecommendationTrackingService:
             recommendation.status = "dismissed"
             recommendation.dismissed_at = datetime.now(timezone.utc)
             recommendation.user_feedback = feedback
-            await self.db.commit()
+            await self.db.flush()
             
             # Trigger learning for model alternatives (dismissed)
             if recommendation.model and recommendation.alternative_model:
@@ -747,7 +747,7 @@ class RecommendationTrackingService:
         if recommendation:
             recommendation.actual_savings = actual_savings
             recommendation.outcome_measured_at = datetime.now(timezone.utc)
-            await self.db.commit()
+            await self.db.flush()
             
             # Update learning with actual outcome for accuracy tracking
             if recommendation.model and recommendation.alternative_model:

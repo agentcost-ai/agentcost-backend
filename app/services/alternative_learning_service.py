@@ -138,7 +138,7 @@ class AlternativeLearningService:
             all_models, max_alternatives_per_model, min_savings_percent
         )
         
-        await self.db.commit()
+        await self.db.flush()
         
         return {
             "status": "ok",
@@ -356,7 +356,7 @@ class AlternativeLearningService:
         )
         
         alt.updated_at = datetime.now(timezone.utc)
-        await self.db.commit()
+        await self.db.flush()
         
         return alt
     
