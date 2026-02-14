@@ -112,13 +112,19 @@ async def register(
         
         # Fire off verification email (non-blocking, won't fail registration if email fails)
         plaintext_token = getattr(user, '_plaintext_verification_token', None)
+        email_sent = False
         if plaintext_token:
             await send_verification_email(user.email, plaintext_token, user.name)
             # Track when verification email was sent
             user.email_verification_sent_at = datetime.now(timezone.utc)
             await db.flush()
+            email_sent = True
         
-        message = "Registration successful. Please check your email to verify your account."
+        if email_sent:
+            message = "Registration successful. Please check your email to verify your account."
+        else:
+            message = "Account successfully linked! You can now sign in with your email and password."
+        
         if pending_count > 0:
             message += f" You have {pending_count} pending project invitation(s) waiting for you."
         
