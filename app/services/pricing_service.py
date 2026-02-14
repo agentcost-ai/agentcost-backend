@@ -180,6 +180,7 @@ class PricingService:
             max_tokens = model_data.get("max_tokens") or model_data.get("max_output_tokens")
             supports_vision = model_data.get("supports_vision", False)
             supports_function_calling = model_data.get("supports_function_calling", False)
+            supports_streaming = model_data.get("supports_streaming", True)
             
             query = select(ModelPricing).where(ModelPricing.model_name == model_name)
             result = await self.db.execute(query)
@@ -215,6 +216,11 @@ class PricingService:
                             "model": model_name, "change": "function_calling",
                             "old": existing.supports_function_calling, "new": supports_function_calling,
                         })
+                    if existing.supports_streaming != supports_streaming:
+                        changes["capability_changes"].append({
+                            "model": model_name, "change": "streaming",
+                            "old": existing.supports_streaming, "new": supports_streaming,
+                        })
                 
                 existing.input_price_per_1k = input_price_per_1k
                 existing.output_price_per_1k = output_price_per_1k
@@ -222,6 +228,7 @@ class PricingService:
                 existing.max_tokens = max_tokens
                 existing.supports_vision = supports_vision
                 existing.supports_function_calling = supports_function_calling
+                existing.supports_streaming = supports_streaming
                 existing.pricing_source = "litellm"
                 existing.source_updated_at = datetime.now(timezone.utc)
                 existing.updated_at = datetime.now(timezone.utc)
@@ -235,6 +242,7 @@ class PricingService:
                         "output_price": round(output_price_per_1k, 6),
                         "supports_vision": supports_vision,
                         "supports_function_calling": supports_function_calling,
+                        "supports_streaming": supports_streaming,
                     })
                 
                 new_pricing = ModelPricing(
@@ -245,6 +253,7 @@ class PricingService:
                     max_tokens=max_tokens,
                     supports_vision=supports_vision,
                     supports_function_calling=supports_function_calling,
+                    supports_streaming=supports_streaming,
                     pricing_source="litellm",
                     source_updated_at=datetime.now(timezone.utc),
                 )
@@ -428,6 +437,15 @@ class PricingService:
         }
         return provider_map.get(provider_lower, provider_lower)
     
+    async def _get_model_record(self, model_name: str) -> Optional[ModelPricing]:
+        """Get a ModelPricing record by name."""
+        query = select(ModelPricing).where(
+            ModelPricing.model_name == model_name,
+            ModelPricing.is_active == True,
+        )
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
+    
     async def discover_alternatives(
         self,
         model: str,
@@ -438,6 +456,8 @@ class PricingService:
         same_provider_only: bool = False,
         max_results: int = 5,
         use_learned: bool = True,
+        success_rate: Optional[float] = None,
+        requires_streaming: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Find cheaper model alternatives using learned data first, then dynamic discovery.
@@ -467,6 +487,8 @@ class PricingService:
                 same_provider_only=same_provider_only,
                 source_provider=source_provider,
                 max_results=max_results,
+                success_rate=success_rate,
+                requires_streaming=requires_streaming,
             )
             
             if learned_alternatives:
@@ -506,7 +528,10 @@ class PricingService:
                             "vision": alt.requires_vision,
                             "function_calling": alt.requires_function_calling,
                             "max_tokens": alt.max_input_tokens_threshold,
+                            "max_output_tokens": alt.max_output_tokens_threshold,
+                            "min_success_rate": alt.min_success_rate_required,
                         },
+                        "notes": alt.notes,
                         # Learned data
                         "source": "learned",
                         "confidence_score": round(alt.confidence_score, 3),
@@ -530,6 +555,7 @@ class PricingService:
             requires_function_calling=requires_function_calling,
             same_provider_only=same_provider_only,
             max_results=max_results,
+            requires_streaming=requires_streaming,
         )
     
     async def _get_learned_alternatives(
@@ -543,6 +569,8 @@ class PricingService:
         source_provider: str,
         max_results: int,
         min_confidence: float = 0.3,
+        success_rate: Optional[float] = None,
+        requires_streaming: bool = False,
     ) -> List:
         """Get learned alternatives from ModelAlternative table."""
         from ..models.db_models import ModelAlternative
@@ -582,10 +610,29 @@ class PricingService:
             return alternatives
 
         # Filter alternatives that cannot support observed token usage
-        filtered = [
-            alt for alt in alternatives
-            if not alt.max_input_tokens_threshold or alt.max_input_tokens_threshold >= total_tokens
-        ]
+        filtered = []
+        for alt in alternatives:
+            # Check max_input_tokens_threshold (total context window)
+            if alt.max_input_tokens_threshold and alt.max_input_tokens_threshold < total_tokens:
+                continue
+            # Check max_output_tokens_threshold
+            if avg_output_tokens and alt.max_output_tokens_threshold and alt.max_output_tokens_threshold < avg_output_tokens:
+                continue
+            # Check min_success_rate_required against current agent's success rate
+            if success_rate is not None and alt.min_success_rate_required:
+                if success_rate < alt.min_success_rate_required:
+                    continue
+            filtered.append(alt)
+
+        # If streaming is required, verify alternative models support it
+        if requires_streaming and filtered:
+            verified = []
+            for alt in filtered:
+                alt_pricing = await self._get_model_record(alt.alternative_model)
+                if alt_pricing and not alt_pricing.supports_streaming:
+                    continue
+                verified.append(alt)
+            return verified
 
         return filtered
     
@@ -612,6 +659,7 @@ class PricingService:
         requires_function_calling: bool,
         same_provider_only: bool,
         max_results: int,
+        requires_streaming: bool = False,
     ) -> List[Dict[str, Any]]:
         """Dynamic discovery of alternatives based on pricing (original logic)."""
         query = select(ModelPricing).where(
@@ -632,6 +680,8 @@ class PricingService:
             if requires_vision and not alt.supports_vision:
                 continue
             if requires_function_calling and not alt.supports_function_calling:
+                continue
+            if requires_streaming and not alt.supports_streaming:
                 continue
             
             if alt.max_tokens:
@@ -665,6 +715,7 @@ class PricingService:
                 "capabilities": {
                     "vision": alt.supports_vision,
                     "function_calling": alt.supports_function_calling,
+                    "streaming": alt.supports_streaming,
                     "max_tokens": alt.max_tokens,
                 },
                 "source": "dynamic",

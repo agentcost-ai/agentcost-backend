@@ -6,7 +6,7 @@ import time
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Query, Body, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
 
@@ -68,6 +68,8 @@ async def list_pricing_models(
                 "max_tokens": m.max_tokens,
                 "supports_vision": m.supports_vision,
                 "supports_function_calling": m.supports_function_calling,
+                "supports_streaming": m.supports_streaming,
+                "notes": m.notes,
                 "source_updated_at": m.source_updated_at.isoformat() if m.source_updated_at else None,
                 "updated_at": m.updated_at.isoformat() if m.updated_at else None,
             }
@@ -147,6 +149,7 @@ async def update_model_pricing(
 
 @router.post("/pricing/sync/litellm")
 async def sync_litellm_pricing(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     admin: User = Depends(require_superuser),
 ):
@@ -185,6 +188,8 @@ async def sync_litellm_pricing(
                 "models_skipped": result.get("models_skipped", 0),
                 "duration_ms": duration_ms,
             },
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
         )
 
         await db.commit()
@@ -208,6 +213,7 @@ async def sync_litellm_pricing(
 
 @router.post("/pricing/sync/openrouter")
 async def sync_openrouter_pricing(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     admin: User = Depends(require_superuser),
 ):
@@ -241,6 +247,8 @@ async def sync_openrouter_pricing(
                 "models_updated": result.get("models_updated", 0),
                 "duration_ms": duration_ms,
             },
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
         )
 
         await db.commit()

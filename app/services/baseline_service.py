@@ -18,6 +18,7 @@ from ..models.db_models import (
     ProjectBaseline, 
     InputPatternCache,
     OptimizationRecommendation,
+    ModelPricing,
 )
 
 
@@ -107,6 +108,8 @@ class BaselineService:
             ).label('stddev_latency'),
             # Error rate
             func.sum(case((Event.success == False, 1), else_=0)).label('error_count'),
+            # Max latency as p95 approximation (mean + 1.645 * stddev for normal distribution)
+            func.max(Event.latency_ms).label('max_latency'),
         ).where(
             Event.project_id == project_id,
             Event.timestamp >= start_time,
@@ -138,7 +141,20 @@ class BaselineService:
             
             error_rate = error_count / call_count if call_count > 0 else 0.0
             daily_calls = call_count / days
-            
+            max_latency = float(row.max_latency) if row.max_latency is not None else 0.0
+
+            # Approximate p95 latency using normal distribution: mean + 1.645 * stddev
+            # Clamp to the observed max to avoid exceeding real data
+            p95_latency = min(
+                avg_latency + 1.645 * stddev_latency,
+                max_latency,
+            ) if stddev_latency > 0 else avg_latency
+
+            # Compute stddev of daily call counts for this agent/model
+            stddev_daily_calls = await self._compute_daily_call_stddev(
+                project_id, row.agent_name, row.model, start_time, end_time, days,
+            )
+
             # Check if baseline exists
             existing_query = select(ProjectBaseline).where(
                 ProjectBaseline.project_id == project_id,
@@ -157,7 +173,9 @@ class BaselineService:
                 baseline.stddev_output_tokens = stddev_output
                 baseline.avg_latency_ms = avg_latency
                 baseline.stddev_latency_ms = stddev_latency
+                baseline.p95_latency_ms = p95_latency
                 baseline.avg_daily_calls = daily_calls
+                baseline.stddev_daily_calls = stddev_daily_calls
                 baseline.avg_error_rate = error_rate
                 baseline.sample_count = call_count
                 baseline.sample_days = days
@@ -175,7 +193,9 @@ class BaselineService:
                     stddev_output_tokens=stddev_output,
                     avg_latency_ms=avg_latency,
                     stddev_latency_ms=stddev_latency,
+                    p95_latency_ms=p95_latency,
                     avg_daily_calls=daily_calls,
+                    stddev_daily_calls=stddev_daily_calls,
                     avg_error_rate=error_rate,
                     sample_count=call_count,
                     sample_days=days,
@@ -203,6 +223,38 @@ class BaselineService:
         result = await self.db.execute(query)
         count = result.scalar()
         return count > 0
+
+    async def _compute_daily_call_stddev(
+        self,
+        project_id: str,
+        agent_name: str,
+        model: str,
+        start_time: datetime,
+        end_time: datetime,
+        days: int,
+    ) -> float:
+        """Compute the standard deviation of daily call counts for an agent/model pair."""
+        daily_q = (
+            select(
+                func.date(Event.timestamp).label("day"),
+                func.count(Event.id).label("cnt"),
+            )
+            .where(
+                Event.project_id == project_id,
+                Event.agent_name == agent_name,
+                Event.model == model,
+                Event.timestamp >= start_time,
+                Event.timestamp <= end_time,
+            )
+            .group_by(func.date(Event.timestamp))
+        )
+        rows = (await self.db.execute(daily_q)).all()
+        if len(rows) < 2:
+            return 0.0
+        counts = [float(r.cnt) for r in rows]
+        mean = sum(counts) / len(counts)
+        variance = sum((c - mean) ** 2 for c in counts) / len(counts)
+        return variance ** 0.5
     
     async def ensure_baselines_exist(self, project_id: str, days: int = 30) -> bool:
         """
@@ -348,6 +400,38 @@ class BaselineService:
                     is_anomaly=True,
                     severity="high" if current_error_rate > 0.2 else "medium",
                 ))
+            
+            # Check p95 latency breach
+            if baseline.p95_latency_ms and baseline.p95_latency_ms > 0:
+                max_recent_latency = float(row.avg_latency) if row.avg_latency is not None else 0.0
+                # Flag if average latency exceeds the historical p95
+                if max_recent_latency > baseline.p95_latency_ms:
+                    anomalies.append(AnomalyResult(
+                        metric_name=f"p95_latency_{row.agent_name}_{row.model}",
+                        current_value=max_recent_latency,
+                        baseline_mean=baseline.p95_latency_ms,
+                        baseline_stddev=0,
+                        z_score=0,
+                        is_anomaly=True,
+                        severity="high" if max_recent_latency > baseline.p95_latency_ms * 1.5 else "medium",
+                    ))
+
+            # Check daily call volume anomaly
+            if baseline.stddev_daily_calls and baseline.stddev_daily_calls > 0 and baseline.avg_daily_calls > 0:
+                hours_in_period = max(1, recent_hours)
+                daily_rate_recent = (call_count / hours_in_period) * 24
+                call_z = (daily_rate_recent - baseline.avg_daily_calls) / baseline.stddev_daily_calls
+                if abs(call_z) > self.ANOMALY_THRESHOLD_MEDIUM:
+                    direction = "higher" if call_z > 0 else "lower"
+                    anomalies.append(AnomalyResult(
+                        metric_name=f"call_volume_{row.agent_name}_{row.model}",
+                        current_value=daily_rate_recent,
+                        baseline_mean=baseline.avg_daily_calls,
+                        baseline_stddev=baseline.stddev_daily_calls,
+                        z_score=call_z,
+                        is_anomaly=True,
+                        severity="high" if abs(call_z) > self.ANOMALY_THRESHOLD_HIGH else "medium",
+                    ))
         
         return anomalies
 
@@ -584,7 +668,7 @@ class RecommendationTrackingService:
         - Estimated savings is below MINIMUM_SAVINGS_THRESHOLD
         """
         # Skip low-value recommendations
-        if estimated_monthly_savings < self.MINIMUM_SAVINGS_THRESHOLD:
+        if (estimated_monthly_savings or 0) < self.MINIMUM_SAVINGS_THRESHOLD:
             return None
 
         safe_metrics = _json_safe(metrics_snapshot) if metrics_snapshot is not None else None

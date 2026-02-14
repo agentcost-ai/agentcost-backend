@@ -7,19 +7,26 @@ management so that route handlers stay thin.
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from sqlalchemy import select, update, func, desc
+from sqlalchemy import select, update, delete, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models.db_models import (
     AdminActivityLog,
+    DailyAggregate,
+    Event,
     Feedback,
     FeedbackEvent,
+    InputPatternCache,
+    OptimizationRecommendation,
+    Project,
+    ProjectBaseline,
 )
-from ..models.user_models import User, UserSession
+from ..models.user_models import PendingEmailInvitation, User, UserSession
+from ..services.email_service import send_admin_email, send_account_deletion_email
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +128,7 @@ async def suspend_user(
     return user
 
 
-async def delete_user_permanently(
+async def soft_delete_user(
     db: AsyncSession,
     *,
     user_id: str,
@@ -129,32 +136,154 @@ async def delete_user_permanently(
     ip_address: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Permanently remove a user and cascade-delete their sessions and
-    project memberships.  Projects owned by the user are NOT deleted;
-    their ``owner_id`` is set to NULL by the FK constraint.
+    Soft-delete a user: mark as deleted, revoke all sessions.
+
+    The user record is preserved but hidden from normal queries.
+    Returns a summary dict.
     """
     user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
     if not user:
         raise ValueError("User not found")
 
-    if user.id == admin.id:
+    if admin and user.id == admin.id:
         raise ValueError("Cannot delete your own account")
 
     if user.is_superuser:
         raise ValueError("Cannot delete a superuser account")
 
-    user_email = user.email
+    if user.is_deleted:
+        raise ValueError("User is already deleted")
+
+    user.is_deleted = True
+    user.deleted_at = datetime.now(timezone.utc)
+    user.is_active = False
+
+    # Revoke all active sessions so tokens fail immediately
+    await db.execute(
+        update(UserSession)
+        .where(UserSession.user_id == user_id, UserSession.is_revoked == False)
+        .values(is_revoked=True)
+    )
+
+    # Send notification email
+    from ..config import get_settings
+    settings = get_settings()
+    grace_days = settings.deletion_grace_days
+    expiry_date = (datetime.now(timezone.utc) + timedelta(days=grace_days)).strftime("%B %d, %Y")
+    
+    # We fire and forget the email (async)
+    await send_account_deletion_email(
+        email=user.email,
+        name=user.name,
+        grace_expiry_date=expiry_date
+    )
 
     await log_admin_action(
         db,
         admin_id=admin.id,
-        action_type="user_deleted",
+        action_type="user_soft_deleted",
         target_type="user",
         target_id=user_id,
-        details={"email": user_email, "permanent": True},
+        details={"email": user.email},
         ip_address=ip_address,
     )
 
+    return {"user_id": user_id, "email": user.email}
+
+
+async def delete_user_permanently(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    admin: Optional[User] = None,
+    ip_address: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Permanently remove a user and all associated data: sessions,
+    memberships, owned projects (with events, aggregates,
+    baselines, patterns, recommendations), and any pending email
+    invitations matching the user's address.
+    """
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if not user:
+        raise ValueError("User not found")
+
+    if admin and user.id == admin.id:
+        raise ValueError("Cannot delete your own account")
+
+    if user.is_superuser and (admin and not admin.is_superuser):
+        # Allow system (admin=None) to delete superusers? 
+        # Maybe safest to say system CAN delete anyone if expired.
+        # But let's prevent non-super admin from deleting super.
+        raise ValueError("Cannot delete a superuser account")
+        
+    if user.is_superuser and admin is None:
+        # Prevent auto-purge of superusers just in case?
+        # Actually superusers shouldn't expire if they are active?
+        # If a superuser was soft-deleted, they should be purgeable.
+        pass
+
+    user_email = user.email
+
+    # Revoke all active sessions so in-flight refresh tokens fail immediately.
+    await db.execute(
+        update(UserSession)
+        .where(UserSession.user_id == user_id, UserSession.is_revoked == False)
+        .values(is_revoked=True)
+    )
+
+    # Delete owned projects and all project-scoped data
+    owned_project_ids_q = select(Project.id).where(Project.owner_id == user_id)
+    owned_ids = (await db.execute(owned_project_ids_q)).scalars().all()
+
+    if owned_ids:
+        # Child tables of projects (no CASCADE FK defined, so delete explicitly)
+        for model in (
+            Event,
+            DailyAggregate,
+            OptimizationRecommendation,
+            ProjectBaseline,
+            InputPatternCache,
+        ):
+            await db.execute(
+                delete(model).where(model.project_id.in_(owned_ids))
+            )
+
+        # PendingEmailInvitation has CASCADE on project_id, but be explicit
+        await db.execute(
+            delete(PendingEmailInvitation)
+            .where(PendingEmailInvitation.project_id.in_(owned_ids))
+        )
+
+        # Now remove the projects themselves
+        await db.execute(
+            delete(Project).where(Project.id.in_(owned_ids))
+        )
+
+    # Clean up pending invitations for this email address
+    # These are invitations to other users' projects — if the user
+    # re-registers with the same email they should NOT inherit access.
+    await db.execute(
+        delete(PendingEmailInvitation)
+        .where(PendingEmailInvitation.email == user_email.lower())
+    )
+
+    # Audit log (before the user row disappears)
+    await log_admin_action(
+        db,
+        admin_id=admin.id if admin else "SYSTEM",
+        action_type="user_deleted",
+        target_type="user",
+        target_id=user_id,
+        details={
+            "email": user_email,
+            "permanent": True,
+            "projects_deleted": len(owned_ids) if owned_ids else 0,
+        },
+        ip_address=ip_address,
+    )
+
+    # Finally delete the user (cascades sessions, memberships, etc.)
     await db.delete(user)
 
     return {"user_id": user_id, "email": user_email}
@@ -325,6 +454,7 @@ async def get_admin_activity_log(
             "target_id": log_entry.target_id,
             "details": log_entry.details,
             "ip_address": log_entry.ip_address,
+            "user_agent": log_entry.user_agent,
             "created_at": log_entry.created_at.isoformat() if log_entry.created_at else None,
         })
 

@@ -9,7 +9,8 @@ import logging
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from sqlalchemy import MetaData, text, inspect
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
+from fastapi import Request
 
 from .config import get_settings
 
@@ -49,12 +50,19 @@ async_session_maker = async_sessionmaker(
 )
 
 
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """Dependency to get database session"""
+async def get_db(request: Optional[Request] = None) -> AsyncGenerator[AsyncSession, None]:
+    """
+    Dependency to get database session.
+    
+    Auto-commits only for write methods (POST, PUT, PATCH, DELETE) or non-HTTP contexts.
+    For safe methods (GET, HEAD, OPTIONS), no commit happens automatically.
+    """
     async with async_session_maker() as session:
         try:
             yield session
-            await session.commit()
+            # Only commit if explicitly a write method or no request context (safety fallback)
+            if request is None or request.method not in {"GET", "HEAD", "OPTIONS"}:
+                await session.commit()
         except Exception:
             await session.rollback()
             raise
@@ -105,6 +113,8 @@ async def _apply_column_migrations(conn):
                 "last_active_at": {"type": "TIMESTAMP"},
                 "auth_provider":  {"type": "VARCHAR(20)", "default": "'email'", "nullable": False},
                 "google_id":      {"type": "VARCHAR(255)"},
+                "is_deleted":     {"type": "BOOLEAN", "default": "false", "nullable": False},
+                "deleted_at":     {"type": "TIMESTAMP"},
             },
             "feedback": {
                 "metadata":        {"type": "JSON"},

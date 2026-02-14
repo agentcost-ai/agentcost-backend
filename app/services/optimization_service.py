@@ -72,7 +72,7 @@ class OptimizationService:
         if not include_low_priority:
             suggestions = [s for s in suggestions if s.get("priority") != "low"]
         
-        suggestions.sort(key=lambda x: x.get("estimated_savings_monthly", 0), reverse=True)
+        suggestions.sort(key=lambda x: x.get("estimated_savings_monthly") or 0, reverse=True)
         
         return suggestions
     
@@ -104,8 +104,8 @@ class OptimizationService:
                     agent_name=suggestion.get("agent_name"),
                     model=suggestion.get("model"),
                     alternative_model=suggestion.get("alternative_model"),
-                    estimated_monthly_savings=suggestion.get("estimated_savings_monthly", 0),
-                    estimated_savings_percent=suggestion.get("estimated_savings_percent", 0),
+                    estimated_monthly_savings=suggestion.get("estimated_savings_monthly") or 0,
+                    estimated_savings_percent=suggestion.get("estimated_savings_percent") or 0,
                     metrics_snapshot=suggestion.get("metrics"),
                 )
         
@@ -334,6 +334,20 @@ class OptimizationService:
                     f"Current: {anomaly.current_value:.0f}ms, "
                     f"Baseline: {anomaly.baseline_mean:.0f}ms"
                 )
+            elif metric_type == "p95":
+                description = (
+                    f"Average latency exceeds historical p95 for {context}. "
+                    f"Current avg: {anomaly.current_value:.0f}ms, "
+                    f"p95 threshold: {anomaly.baseline_mean:.0f}ms"
+                )
+            elif metric_type == "call":
+                direction = "higher" if anomaly.z_score > 0 else "lower"
+                description = (
+                    f"Daily call volume is {abs(anomaly.z_score):.1f} standard deviations "
+                    f"{direction} than normal for {context}. "
+                    f"Current: {anomaly.current_value:.0f} calls/day, "
+                    f"Baseline: {anomaly.baseline_mean:.0f} calls/day"
+                )
             elif metric_type == "error":
                 description = (
                     f"Error rate is elevated for {context}. "
@@ -525,6 +539,19 @@ class OptimizationService:
             if z_score < 2.0:
                 continue
             
+            # Include p95 context in the description when available
+            p95_context = ""
+            if baseline.p95_latency_ms and baseline.p95_latency_ms > 0:
+                if avg_latency > baseline.p95_latency_ms:
+                    p95_context = (
+                        f" Current latency also exceeds the historical p95 of "
+                        f"{baseline.p95_latency_ms:.0f}ms."
+                    )
+                else:
+                    p95_context = (
+                        f" (p95 threshold: {baseline.p95_latency_ms:.0f}ms)"
+                    )
+            
             action_items = self._build_latency_actions(
                 agent=agent,
                 model=model,
@@ -540,7 +567,7 @@ class OptimizationService:
                 "description": (
                     f"Agent '{agent}' has elevated latency "
                     f"({avg_latency:.0f}ms vs {baseline.avg_latency_ms:.0f}ms baseline) "
-                    f"with {avg_input:.0f} average input tokens. "
+                    f"with {avg_input:.0f} average input tokens.{p95_context} "
                     f"Consider shortening prompts or using streaming."
                 ),
                 "estimated_savings_monthly": 0,
@@ -552,6 +579,7 @@ class OptimizationService:
                 "metrics": {
                     "avg_latency_ms": round(avg_latency, 0),
                     "baseline_latency_ms": round(baseline.avg_latency_ms, 0),
+                    "p95_latency_ms": round(baseline.p95_latency_ms, 0) if baseline.p95_latency_ms else None,
                     "z_score": round(z_score, 2),
                     "avg_input_tokens": round(avg_input, 0),
                 },
@@ -690,6 +718,26 @@ class OptimizationService:
                 actions.append(f"Review recent prompt changes that may have increased token count")
             else:
                 actions.append(f"Latency improved for {context} - no action needed")
+        elif metric_type == "p95":
+            actions.append(
+                f"Average latency has breached the historical p95 ({baseline_mean:.0f}ms) for {context} - "
+                f"investigate provider degradation or increased prompt complexity"
+            )
+            actions.append(
+                f"Consider enabling response streaming or switching to a lower-latency model for {context}"
+            )
+        elif metric_type == "call":
+            if z_score > 0:
+                actions.append(
+                    f"Call volume surged {deviation_pct:.0f}% above normal for {context} - "
+                    f"verify this isn't a runaway loop or unexpected traffic spike"
+                )
+                actions.append(f"Review upstream services that trigger {context} calls")
+            else:
+                actions.append(
+                    f"Call volume dropped {deviation_pct:.0f}% for {context} - "
+                    f"check if upstream services are healthy"
+                )
         elif metric_type == "error":
             actions.append(
                 f"Error rate at {current_value*100:.1f}% for {context} - "

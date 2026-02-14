@@ -18,6 +18,8 @@ from .email_templates import (
     get_feedback_admin_email_html,
     get_feedback_update_email_html,
     get_admin_direct_email_html,
+    get_welcome_email_html,
+    get_account_deletion_email_html,
 )
 
 settings = get_settings()
@@ -175,6 +177,54 @@ async def send_feedback_update_email(
         link=link,
     )
     return await _send_async(email, "Your feedback has been updated", html)
+
+
+async def send_welcome_email(
+    email: str,
+    name: Optional[str] = None,
+    user_number: int = 0,
+    milestone_badge: Optional[str] = None,
+) -> bool:
+    """Send welcome email with early-adopter badge to a new user."""
+    dashboard_link = FRONTEND_URL
+    html = get_welcome_email_html(
+        name=name,
+        user_number=user_number,
+        milestone_badge=milestone_badge,
+        dashboard_link=dashboard_link,
+    )
+    subject = "Welcome to AgentCost"
+    if milestone_badge:
+        subject = f"Welcome to AgentCost — You're #{user_number}!"
+    return await _send_async(email, subject, html)
+
+
+async def send_account_deletion_email(
+    email: str,
+    name: Optional[str],
+    grace_expiry_date: str,
+) -> bool:
+    """
+    Notify user that their account is scheduled for deletion.
+    
+    Includes grace period expiry date and reactivation link.
+    """
+    login_link = f"{FRONTEND_URL}/auth/login"
+    grace_days = settings.deletion_grace_days
+    
+    html = get_account_deletion_email_html(
+        email=email,
+        name=name,
+        grace_days=grace_days,
+        expiry_date=grace_expiry_date,
+        login_link=login_link,
+    )
+    
+    return await _send_async(
+        email, 
+        "Action Required: Account Deletion Scheduled", 
+        html
+    )
 
 
 def send_admin_email(to: str, subject: str, body: str) -> bool:

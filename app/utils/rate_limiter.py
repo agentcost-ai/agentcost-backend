@@ -6,6 +6,7 @@ For production with multiple instances, use Redis instead.
 """
 
 import time
+import hashlib
 from collections import defaultdict
 from typing import Optional
 from fastapi import Request, HTTPException
@@ -71,7 +72,8 @@ class RateLimiter:
         # Try to get API key
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
-            return f"api_key:{auth_header[7:20]}..."  # Use prefix for privacy
+            key_hash = hashlib.sha256(auth_header.encode()).hexdigest()
+            return f"api_key:{key_hash}"
         
         # Fall back to IP
         forwarded = request.headers.get("X-Forwarded-For")

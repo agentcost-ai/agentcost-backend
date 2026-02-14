@@ -15,6 +15,7 @@ from ...models.user_models import User, UserSession, ProjectMember
 from ...models.db_models import Project, Event, UserMilestone
 from ...services.admin_service import (
     log_admin_action,
+    soft_delete_user as svc_soft_delete_user,
     delete_user_permanently as svc_delete_user,
     update_admin_notes as svc_update_admin_notes,
 )
@@ -26,7 +27,7 @@ router = APIRouter()
 
 def _escape_like(value: str) -> str:
     """Escape special LIKE/ILIKE characters to prevent wildcard injection."""
-    return value.replace("%", "\\%").replace("_", "\\_")
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 class AdminUserUpdate(BaseModel):
@@ -51,6 +52,7 @@ async def list_users(
     search: Optional[str] = Query(None, description="Search by email or name"),
     is_active: Optional[bool] = Query(None),
     is_superuser: Optional[bool] = Query(None),
+    include_deleted: bool = Query(False, description="Include soft-deleted users"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     sort: str = Query("created_at", description="Sort field"),
@@ -60,6 +62,10 @@ async def list_users(
 ):
     """List all users with search, filter, and pagination."""
     query = select(User)
+
+    # Exclude soft-deleted users by default
+    if not include_deleted:
+        query = query.where(User.is_deleted == False)
 
     if search:
         escaped = _escape_like(search)
@@ -96,6 +102,9 @@ async def list_users(
                 "milestone_badge": u.milestone_badge,
                 "created_at": u.created_at.isoformat() if u.created_at else None,
                 "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
+                "last_active_at": u.last_active_at.isoformat() if u.last_active_at else None,
+                "is_deleted": u.is_deleted,
+                "deleted_at": u.deleted_at.isoformat() if u.deleted_at else None,
             }
             for u in users
         ],
@@ -171,6 +180,10 @@ async def get_user_detail(
         "milestone_badge": user.milestone_badge,
         "created_at": user.created_at.isoformat() if user.created_at else None,
         "last_login_at": user.last_login_at.isoformat() if user.last_login_at else None,
+        "last_active_at": user.last_active_at.isoformat() if user.last_active_at else None,
+        "email_verification_sent_at": user.email_verification_sent_at.isoformat() if user.email_verification_sent_at else None,
+        "is_deleted": user.is_deleted,
+        "deleted_at": user.deleted_at.isoformat() if user.deleted_at else None,
         "active_sessions": session_count,
         "owned_projects": [
             {
@@ -195,6 +208,7 @@ async def get_user_detail(
                 "milestone_type": m.milestone_type,
                 "milestone_name": m.milestone_name,
                 "milestone_description": m.milestone_description,
+                "metadata_json": m.metadata_json,
                 "achieved_at": m.achieved_at.isoformat() if m.achieved_at else None,
             }
             for m in milestones
@@ -252,6 +266,7 @@ async def update_user(
             target_id=user_id,
             details=changes,
             ip_address=ip,
+            user_agent=request.headers.get("user-agent") if request else None,
         )
 
     await db.commit()
@@ -287,6 +302,7 @@ async def revoke_user_sessions(
         target_id=user_id,
         details={"revoked_count": result.rowcount},
         ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
     )
     await db.commit()
     return {"revoked": result.rowcount}
@@ -296,26 +312,36 @@ async def revoke_user_sessions(
 async def delete_user(
     user_id: str,
     request: Request,
+    permanent: bool = Query(False, description="Permanently delete instead of soft-delete"),
     db: AsyncSession = Depends(get_db),
     admin: User = Depends(require_superuser),
 ):
     """
-    Permanently delete a user and cascade-remove sessions and memberships.
-    Owned projects are orphaned (owner_id set to NULL), not deleted.
+    Delete a user. Performs soft-delete by default (marks as deleted).
+    Pass ?permanent=true to permanently remove the user and all associated data.
     Cannot delete superuser accounts or your own account.
     """
     try:
-        result = await svc_delete_user(
-            db,
-            user_id=user_id,
-            admin=admin,
-            ip_address=request.client.host if request.client else None,
-        )
+        if permanent:
+            result = await svc_delete_user(
+                db,
+                user_id=user_id,
+                admin=admin,
+                ip_address=request.client.host if request.client else None,
+            )
+            await db.commit()
+            return {"message": "User deleted permanently", **result}
+        else:
+            result = await svc_soft_delete_user(
+                db,
+                user_id=user_id,
+                admin=admin,
+                ip_address=request.client.host if request.client else None,
+            )
+            await db.commit()
+            return {"message": "User soft-deleted", **result}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
-
-    await db.commit()
-    return {"message": "User deleted permanently", **result}
 
 
 @router.put("/users/{user_id}/notes")
@@ -367,6 +393,7 @@ async def send_email_to_user(
         target_id=user_id,
         details={"subject": subject, "success": success},
         ip_address=request.client.host if request and request.client else None,
+        user_agent=request.headers.get("user-agent") if request else None,
     )
     await db.commit()
 

@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from typing import Optional
+import hashlib
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -192,7 +193,7 @@ async def submit_feedback(
         environment=feedback.environment,
         client_metadata=feedback.client_metadata,
         is_confidential=feedback.type == "security_report",
-        ip_address=ip_address,
+        ip_address=hashlib.sha256(ip_address.encode()).hexdigest() if ip_address else None,
         user_agent=user_agent_str,
     )
 

@@ -8,7 +8,7 @@ from sqlalchemy import (
     Column, String, Integer, Float, Boolean, DateTime, Text, ForeignKey,
     Index, Enum
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, backref
 from sqlalchemy.sql import func
 from datetime import datetime
 import enum
@@ -57,13 +57,17 @@ class User(Base):
     user_number = Column(Integer, unique=True, nullable=True)  # Sequential registration order
     milestone_badge = Column(String(50), nullable=True)  # top_20, top_50, top_100, top_1000, early_adopter
     
+    # Soft-delete support
+    is_deleted = Column(Boolean, default=False, nullable=False, index=True)
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     last_login_at = Column(DateTime(timezone=True), nullable=True)
     last_active_at = Column(DateTime(timezone=True), nullable=True)
     
     owned_projects = relationship("Project", back_populates="owner", foreign_keys="Project.owner_id")
-    project_memberships = relationship("ProjectMember", back_populates="user", foreign_keys="ProjectMember.user_id")
+    project_memberships = relationship("ProjectMember", back_populates="user", foreign_keys="ProjectMember.user_id", passive_deletes=True)
     sessions = relationship("UserSession", back_populates="user", cascade="all, delete-orphan")
     
     def __repr__(self):
@@ -116,7 +120,7 @@ class ProjectMember(Base):
     
     role = Column(String(20), default=UserRole.MEMBER.value, nullable=False)
     
-    invited_by_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    invited_by_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     invited_at = Column(DateTime(timezone=True), server_default=func.now())
     accepted_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -147,7 +151,7 @@ class PendingEmailInvitation(Base):
     
     role = Column(String(20), default=UserRole.MEMBER.value, nullable=False)
     
-    invited_by_id = Column(String(36), ForeignKey("users.id"), nullable=True)
+    invited_by_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     invited_at = Column(DateTime(timezone=True), server_default=func.now())
     
     project = relationship("Project")
@@ -198,7 +202,7 @@ class PolicyConsent(Base):
     consented_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     
     # Relationship
-    user = relationship("User", backref="policy_consents")
+    user = relationship("User", backref=backref("policy_consents", passive_deletes=True))
     
     __table_args__ = (
         # Index for efficient policy version checks

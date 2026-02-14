@@ -89,6 +89,9 @@ class UserResponse(BaseModel):
     is_active: bool
     created_at: datetime
     last_login_at: Optional[datetime] = None
+    auth_provider: str = "email"
+    user_number: Optional[int] = None
+    milestone_badge: Optional[str] = None
     
     model_config = ConfigDict(from_attributes=True)
 

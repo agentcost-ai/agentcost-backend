@@ -61,6 +61,8 @@ class Event(Base):
     total_tokens = Column(Integer, nullable=False)
     
     cost = Column(Float, nullable=False)
+    # Track where the cost figure came from ('database', 'defaults', 'client-sdk')
+    cost_source = Column(String(50), nullable=True)
     latency_ms = Column(Integer, nullable=False)
     
     success = Column(Boolean, default=True)

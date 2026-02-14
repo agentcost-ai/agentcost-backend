@@ -39,13 +39,21 @@ class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
         
         # Fallback: if Content-Length is missing, read body to enforce limit
         if request.method in {"POST", "PUT", "PATCH"} and not content_length:
-            body = await request.body()
-            if len(body) > max_size_bytes:
-                return JSONResponse(
-                    status_code=413,
-                    content={
-                        "detail": f"Request body too large. Maximum size is {settings.max_request_size_mb}MB."
-                    },
-                )
+            body_chunks = []
+            received_size = 0
+            
+            async for chunk in request.stream():
+                received_size += len(chunk)
+                if received_size > max_size_bytes:
+                    return JSONResponse(
+                        status_code=413,
+                        content={
+                            "detail": f"Request body too large. Maximum size is {settings.max_request_size_mb}MB."
+                        },
+                    )
+                body_chunks.append(chunk)
+            
+            # Reconstruct body for downstream handlers so request.body() works
+            request._body = b"".join(body_chunks)
 
         return await call_next(request)

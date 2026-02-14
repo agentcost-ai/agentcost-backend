@@ -157,11 +157,9 @@ async def get_optional_user(
     if not credentials:
         return None
 
-    user = await get_current_user(db, credentials.credentials)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return user
+    try:
+        user = await get_current_user(db, credentials.credentials)
+    except Exception:
+        # Token was provided but is invalid/expired — treat as unauthenticated
+        return None
+    return user  # May be None if user no longer exists

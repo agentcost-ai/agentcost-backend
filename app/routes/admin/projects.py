@@ -2,10 +2,10 @@
 Admin routes -- project and API key governance.
 """
 
-import uuid
-from typing import Optional, Dict, Any
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Body
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc, or_
 
@@ -13,9 +13,20 @@ from ...database import get_db
 from ...models.user_models import User, ProjectMember
 from ...models.db_models import Project, Event
 from ...services.admin_service import log_admin_action
+from ...utils.auth import generate_secure_api_key
 from ._deps import require_superuser
 
 router = APIRouter()
+
+
+def _escape_like(value: str) -> str:
+    """Escape special LIKE/ILIKE characters to prevent wildcard injection."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+class AdminProjectUpdate(BaseModel):
+    """Typed body for admin project update."""
+    is_active: Optional[bool] = None
 
 
 @router.get("/projects")
@@ -33,7 +44,8 @@ async def list_projects(
     query = select(Project, User).outerjoin(User, Project.owner_id == User.id)
 
     if search:
-        pattern = f"%{search}%"
+        escaped = _escape_like(search)
+        pattern = f"%{escaped}%"
         query = query.where(
             or_(Project.name.ilike(pattern), User.email.ilike(pattern))
         )
@@ -145,7 +157,7 @@ async def get_project_detail(
 @router.patch("/projects/{project_id}")
 async def update_project(
     project_id: str,
-    body: Dict[str, Any] = Body(...),
+    body: AdminProjectUpdate,
     request: Request = None,
     db: AsyncSession = Depends(get_db),
     admin: User = Depends(require_superuser),
@@ -156,14 +168,14 @@ async def update_project(
         raise HTTPException(status_code=404, detail="Project not found")
 
     changes = {}
-    if "is_active" in body:
+    if body.is_active is not None:
         old_val = proj.is_active
-        proj.is_active = body["is_active"]
-        if old_val != body["is_active"]:
-            changes["is_active"] = {"old": old_val, "new": body["is_active"]}
+        proj.is_active = body.is_active
+        if old_val != body.is_active:
+            changes["is_active"] = {"old": old_val, "new": body.is_active}
 
     if changes:
-        action = "project_resumed" if body.get("is_active") else "project_frozen"
+        action = "project_resumed" if body.is_active else "project_frozen"
         await log_admin_action(
             db,
             admin_id=admin.id,
@@ -172,6 +184,7 @@ async def update_project(
             target_id=project_id,
             details=changes,
             ip_address=request.client.host if request and request.client else None,
+            user_agent=request.headers.get("user-agent") if request else None,
         )
 
     await db.commit()
@@ -191,8 +204,8 @@ async def rotate_project_key(
     if not proj:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    new_key = f"sk_{uuid.uuid4().hex}"
-    proj.api_key = new_key
+    plaintext_key, hashed_key = generate_secure_api_key()
+    proj.api_key = hashed_key
 
     await log_admin_action(
         db,
@@ -200,15 +213,19 @@ async def rotate_project_key(
         action_type="project_key_rotated",
         target_type="project",
         target_id=project_id,
-        details={"new_key_prefix": new_key[:7] + "..."},
+        details={"new_key_prefix": plaintext_key[:10] + "..."},
         ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
     )
     await db.commit()
 
     return {
         "id": proj.id,
-        "key_prefix": new_key[:7] + "...",
-        "message": "API key rotated. Users must update their SDK configuration.",
+        "new_api_key": plaintext_key,
+        "message": (
+            "API key rotated. This is the only time the full key will be shown. "
+            "Users must update their SDK configuration."
+        ),
     }
 
 
@@ -234,6 +251,7 @@ async def revoke_project_key(
         target_id=project_id,
         details={},
         ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
     )
     await db.commit()
 

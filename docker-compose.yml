@@ -6,13 +6,9 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=sqlite+aiosqlite:///./agentcost.db
-      - SECRET_KEY=your-secret-key-change-in-production
+      - DATABASE_URL=${DATABASE_URL:-sqlite+aiosqlite:///./agentcost.db}
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env}
       - DEBUG=true
-      # Initial admin account — created automatically on first startup
-      - ADMIN_EMAIL=admin@agentcost.dev
-      - ADMIN_PASSWORD=ChangeMe!2024
-      - ADMIN_NAME=Admin
     volumes:
       - ./data:/app/data
     restart: unless-stopped
@@ -21,9 +17,9 @@ services:
   # postgres:
   #   image: postgres:15
   #   environment:
-  #     POSTGRES_USER: agentcost
-  #     POSTGRES_PASSWORD: agentcost
-  #     POSTGRES_DB: agentcost
+  #     POSTGRES_USER: ${POSTGRES_USER}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  #     POSTGRES_DB: ${POSTGRES_DB:-agentcost}
   #   ports:
   #     - "5432:5432"
   #   volumes:

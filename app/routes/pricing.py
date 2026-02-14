@@ -222,8 +222,15 @@ async def get_model_pricing(model_name: str, db: AsyncSession = Depends(get_db))
         }
     
     model_lower = model_name.lower()
-    for name, pricing in DEFAULT_PRICING.items():
-        if name in model_lower or model_lower in name:
+    
+    # Sort by length descending to match most specific model first (e.g. "gpt-4-turbo" before "gpt-4")
+    sorted_pricing = sorted(DEFAULT_PRICING.items(), key=lambda x: len(x[0]), reverse=True)
+    
+    for name, pricing in sorted_pricing:
+        # Check if known model name is contained in requested model name
+        # e.g. "gpt-4" in "gpt-4-0613" -> Match
+        # But "gpt-4-turbo" NOT in "gpt-4" -> No match (correct)
+        if name in model_lower:
             return {
                 "model": model_name,
                 "matched_to": name,

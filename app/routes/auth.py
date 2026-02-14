@@ -2,6 +2,7 @@
 
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, status, Request, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,9 +18,10 @@ from ..models.auth_schemas import (
     GoogleAuthRequest
 )
 from ..services.auth_service import AuthService, get_current_user, decode_token, verify_google_id_token
-from ..services.email_service import send_verification_email, send_password_reset_email
+from ..services.email_service import send_verification_email, send_password_reset_email, send_welcome_email
 from ..services.member_service import MemberService
 from ..models.user_models import User
+from ..models.db_models import UserMilestone
 from ..config import get_settings
 from ..utils.auth import get_required_user, get_optional_user
 
@@ -112,6 +114,9 @@ async def register(
         plaintext_token = getattr(user, '_plaintext_verification_token', None)
         if plaintext_token:
             await send_verification_email(user.email, plaintext_token, user.name)
+            # Track when verification email was sent
+            user.email_verification_sent_at = datetime.now(timezone.utc)
+            await db.flush()
         
         message = "Registration successful. Please check your email to verify your account."
         if pending_count > 0:
@@ -127,6 +132,9 @@ async def register(
                 is_active=user.is_active,
                 created_at=user.created_at,
                 last_login_at=user.last_login_at,
+                auth_provider=getattr(user, 'auth_provider', 'email'),
+                user_number=user.user_number,
+                milestone_badge=user.milestone_badge,
             ),
             message=message
         )
@@ -195,6 +203,29 @@ async def google_auth(
         pending_count = await member_service.process_pending_invitations_for_user(user)
         if pending_count > 0:
             print(f"[AUTH] Processed {pending_count} pending invitation(s) for {user.email}")
+        
+        # Send welcome email with early-adopter badge (skip for superusers/admins)
+        if user.user_number and not getattr(user, 'is_superuser', False):
+            try:
+                sent = await send_welcome_email(
+                    email=user.email,
+                    name=user.name,
+                    user_number=user.user_number,
+                    milestone_badge=user.milestone_badge,
+                )
+                if sent:
+                    from sqlalchemy import update
+                    await db.execute(
+                        update(UserMilestone)
+                        .where(
+                            UserMilestone.user_id == user.id,
+                            UserMilestone.milestone_type == "signup_position",
+                        )
+                        .values(notified=True)
+                    )
+                    await db.flush()
+            except Exception:
+                pass  # Don't fail auth if welcome email fails
     
     # Generate tokens and create session (same as regular login)
     return await auth_service.login_user(
@@ -375,13 +406,28 @@ async def logout_all(
 
 @router.get("/me", response_model=UserResponse)
 async def get_me(
-    user: User = Depends(get_required_user)
+    user: User = Depends(get_required_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Get current authenticated user's profile.
     
     Requires authentication.
+    Also updates last_active_at to track user activity (debounced to 5 mins).
     """
+    # Update last_active_at at most once every 5 minutes to reduce write load
+    now = datetime.now(timezone.utc)
+    should_update = True
+    
+    if user.last_active_at:
+        elapsed = (now - user.last_active_at).total_seconds()
+        if elapsed < 300:  # 5 minutes
+            should_update = False
+            
+    if should_update:
+        user.last_active_at = now
+        await db.commit()
+    
     return UserResponse(
         id=user.id,
         email=user.email,
@@ -391,6 +437,9 @@ async def get_me(
         is_active=user.is_active,
         created_at=user.created_at,
         last_login_at=user.last_login_at,
+        auth_provider=getattr(user, 'auth_provider', 'email'),
+        user_number=user.user_number,
+        milestone_badge=user.milestone_badge,
     )
 
 
@@ -416,6 +465,9 @@ async def update_me(
         is_active=updated.is_active,
         created_at=updated.created_at,
         last_login_at=updated.last_login_at,
+        auth_provider=getattr(updated, 'auth_provider', 'email'),
+        user_number=updated.user_number,
+        milestone_badge=updated.milestone_badge,
     )
 
 
@@ -517,6 +569,29 @@ async def verify_email(
             detail="Invalid or expired verification token"
         )
     
+    # Send welcome email now that the address is confirmed (skip for superusers/admins)
+    if user.user_number and not getattr(user, 'is_superuser', False):
+        try:
+            sent = await send_welcome_email(
+                email=user.email,
+                name=user.name,
+                user_number=user.user_number,
+                milestone_badge=user.milestone_badge,
+            )
+            if sent:
+                from sqlalchemy import update, select
+                await auth_service.db.execute(
+                    update(UserMilestone)
+                    .where(
+                        UserMilestone.user_id == user.id,
+                        UserMilestone.milestone_type == "signup_position",
+                    )
+                    .values(notified=True)
+                )
+                await auth_service.db.flush()
+        except Exception:
+            pass  # Don't fail verification if welcome email fails
+    
     return None
 
 
@@ -537,6 +612,9 @@ async def resend_verification(
         new_token = await auth_service.regenerate_verification_token(user.id)
         if new_token:
             await send_verification_email(user.email, new_token, user.name)
+            # Track when verification email was sent
+            user.email_verification_sent_at = datetime.now(timezone.utc)
+            await auth_service.db.flush()
     
     return None
 

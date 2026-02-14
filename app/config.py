@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     
     # Email - for verification and password reset emails
     resend_api_key: str = ""
-    resend_sender_email: str = "noreply@agentcost.dev"
+    resend_sender_email: str = "noreply@agentcost.tech"
     resend_sender_name: str = "AgentCost"
     frontend_url: str = "http://localhost:3000"
     feedback_admin_email: str = ""
@@ -105,6 +105,9 @@ class Settings(BaseSettings):
     
     # Extended session duration (for "remember me" feature)
     extended_session_days: int = 30
+    
+    # Account deletion grace period (days)
+    deletion_grace_days: int = 7
     
     # External pricing sources (with fallback defaults)
     litellm_pricing_url: str = (

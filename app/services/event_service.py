@@ -43,70 +43,78 @@ class EventService:
         
         # pre-fetch pricing for all unique models in the batch
         # to eliminate N+1 per-event DB queries.
-        unique_models = {e.model for e in events}
-        pricing_cache: dict[str, dict | None] = {}
-        for model_name in unique_models:
-            pricing_cache[model_name] = await pricing_service.get_model_pricing(model_name)
+        try:
+            unique_models = {e.model for e in events}
+            pricing_cache: dict[str, dict | None] = {}
+            for model_name in unique_models:
+                pricing_cache[model_name] = await pricing_service.get_model_pricing(model_name)
 
-        # Collect pattern records to batch after the loop
-        pattern_records: list[tuple[str, str, str, float]] = []
+            # Collect pattern records to batch after the loop
+            pattern_records: list[tuple[str, str, str, float]] = []
 
-        for event_data in events:
-            # Parse timestamp
-            timestamp = datetime.fromisoformat(
-                event_data.timestamp.replace('Z', '+00:00')
-            )
-            
-            total_tokens = event_data.input_tokens + event_data.output_tokens
-
-            # Use cached pricing instead of per-event DB query
-            pricing = pricing_cache.get(event_data.model)
-            if pricing is not None:
-                input_cost = (event_data.input_tokens / 1000) * pricing["input"]
-                output_cost = (event_data.output_tokens / 1000) * pricing["output"]
-                calculated_cost = round(input_cost + output_cost, 8)
-            else:
-                calculated_cost = 0.0
-
-            # Use server cost when available; fall back to SDK-provided cost
-            final_cost = calculated_cost if calculated_cost > 0 else event_data.cost
-
-            db_event = Event(
-                project_id=project_id,
-                agent_name=event_data.agent_name,
-                model=event_data.model,
-                input_tokens=event_data.input_tokens,
-                output_tokens=event_data.output_tokens,
-                total_tokens=total_tokens,
-                cost=final_cost,
-                latency_ms=event_data.latency_ms,
-                timestamp=timestamp,
-                success=event_data.success,
-                error=event_data.error,
-                extra_data=event_data.metadata,
-                input_hash=event_data.input_hash,
-            )
-            db_events.append(db_event)
-            
-            # Collect pattern for later batch recording
-            if event_data.input_hash:
-                pattern_records.append(
-                    (event_data.agent_name, event_data.input_hash, final_cost)
+            for event_data in events:
+                # Parse timestamp
+                timestamp = datetime.fromisoformat(
+                    event_data.timestamp.replace('Z', '+00:00')
                 )
+                
+                total_tokens = event_data.input_tokens + event_data.output_tokens
 
-        # Batch-record patterns in one pass (still individual inserts but
-        # avoids interleaving with pricing queries)
-        for agent_name, input_hash, cost in pattern_records:
-            await pattern_service.record_pattern(
-                project_id=project_id,
-                agent_name=agent_name,
-                input_hash=input_hash,
-                cost=cost,
-            )
-        
-        self.db.add_all(db_events)
-        await self.db.flush()  # Let get_db handle the final commit
-        await pricing_service.close()
+                # Use cached pricing instead of per-event DB query
+                pricing = pricing_cache.get(event_data.model)
+                if pricing is not None:
+                    input_cost = (event_data.input_tokens / 1000) * pricing["input"]
+                    output_cost = (event_data.output_tokens / 1000) * pricing["output"]
+                    calculated_cost = round(input_cost + output_cost, 8)
+                else:
+                    calculated_cost = 0.0
+
+                # Use server cost when available; fall back to SDK-provided cost
+                if calculated_cost > 0:
+                    final_cost = calculated_cost
+                    cost_source = pricing.get("source", "database")
+                else:
+                    final_cost = event_data.cost
+                    cost_source = "client-sdk"
+
+                db_event = Event(
+                    project_id=project_id,
+                    agent_name=event_data.agent_name,
+                    model=event_data.model,
+                    input_tokens=event_data.input_tokens,
+                    output_tokens=event_data.output_tokens,
+                    total_tokens=total_tokens,
+                    cost=final_cost,
+                    cost_source=cost_source,
+                    latency_ms=event_data.latency_ms,
+                    timestamp=timestamp,
+                    success=event_data.success,
+                    error=event_data.error,
+                    extra_data=event_data.metadata,
+                    input_hash=event_data.input_hash,
+                )
+                db_events.append(db_event)
+                
+                # Collect pattern for later batch recording
+                if event_data.input_hash:
+                    pattern_records.append(
+                        (event_data.agent_name, event_data.input_hash, final_cost)
+                    )
+
+            # Batch-record patterns in one pass (still individual inserts but
+            # avoids interleaving with pricing queries)
+            for agent_name, input_hash, cost in pattern_records:
+                await pattern_service.record_pattern(
+                    project_id=project_id,
+                    agent_name=agent_name,
+                    input_hash=input_hash,
+                    cost=cost,
+                )
+            
+            self.db.add_all(db_events)
+            await self.db.flush()  # Let get_db handle the final commit
+        finally:
+            await pricing_service.close()
         
         return len(db_events)
     

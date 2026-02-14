@@ -124,6 +124,7 @@ class AlternativeLearningService:
                         requires_vision=requires_vision,
                         requires_function_calling=requires_function_calling,
                         max_input_tokens=cheaper.max_tokens,
+                        max_output_tokens=cheaper.max_tokens,
                     )
                     
                     if is_new:
@@ -217,6 +218,7 @@ class AlternativeLearningService:
                     requires_vision=expensive.supports_vision or False,
                     requires_function_calling=expensive.supports_function_calling or False,
                     max_input_tokens=cheaper.max_tokens,
+                    max_output_tokens=cheaper.max_tokens,
                 )
                 
                 if is_new:
@@ -239,6 +241,8 @@ class AlternativeLearningService:
         requires_vision: bool,
         requires_function_calling: bool,
         max_input_tokens: Optional[int] = None,
+        max_output_tokens: Optional[int] = None,
+        supports_streaming_source: bool = True,
     ) -> bool:
         """Create or update an alternative. Returns True if new, False if updated."""
         query = select(ModelAlternative).where(
@@ -259,9 +263,38 @@ class AlternativeLearningService:
             existing.requires_function_calling = requires_function_calling
             if max_input_tokens:
                 existing.max_input_tokens_threshold = max_input_tokens
+            if max_output_tokens:
+                existing.max_output_tokens_threshold = max_output_tokens
+            # Set min_success_rate based on savings magnitude: bigger savings = higher
+            # success threshold needed (riskier swap needs more confidence)
+            savings_pct = (1 - price_ratio) * 100 if price_ratio < 1 else 0
+            if savings_pct >= 60:
+                existing.min_success_rate_required = 0.98
+            elif savings_pct >= 40:
+                existing.min_success_rate_required = 0.95
+            elif savings_pct >= 20:
+                existing.min_success_rate_required = 0.90
+            else:
+                existing.min_success_rate_required = 0.85
+            # Auto-generate notes describing the alternative
+            existing.notes = self._generate_alternative_notes(
+                source_model, alternative_model,
+                source_provider, alternative_provider,
+                price_ratio, requires_vision, requires_function_calling,
+            )
             existing.updated_at = datetime.now(timezone.utc)
             return False
         else:
+            # Set min_success_rate based on savings magnitude
+            savings_pct = (1 - price_ratio) * 100 if price_ratio < 1 else 0
+            if savings_pct >= 60:
+                min_success_rate = 0.98
+            elif savings_pct >= 40:
+                min_success_rate = 0.95
+            elif savings_pct >= 20:
+                min_success_rate = 0.90
+            else:
+                min_success_rate = 0.85
             # Create new alternative with neutral confidence
             new_alt = ModelAlternative(
                 source_model=source_model,
@@ -274,11 +307,47 @@ class AlternativeLearningService:
                 requires_vision=requires_vision,
                 requires_function_calling=requires_function_calling,
                 max_input_tokens_threshold=max_input_tokens,
+                max_output_tokens_threshold=max_output_tokens,
+                min_success_rate_required=min_success_rate,
+                notes=self._generate_alternative_notes(
+                    source_model, alternative_model,
+                    source_provider, alternative_provider,
+                    price_ratio, requires_vision, requires_function_calling,
+                ),
                 confidence_score=0.5,  # Neutral start
                 source="auto",
             )
             self.db.add(new_alt)
             return True
+    
+    def _generate_alternative_notes(
+        self,
+        source_model: str,
+        alternative_model: str,
+        source_provider: str,
+        alternative_provider: str,
+        price_ratio: float,
+        requires_vision: bool,
+        requires_function_calling: bool,
+    ) -> str:
+        """Generate human-readable notes describing why this alternative was created."""
+        savings_pct = round((1 - price_ratio) * 100, 1)
+        parts = [f"{savings_pct}% cheaper than {source_model}"]
+        
+        if source_provider == alternative_provider:
+            parts.append(f"same provider ({source_provider})")
+        else:
+            parts.append(f"cross-provider ({source_provider} -> {alternative_provider})")
+        
+        caps = []
+        if requires_vision:
+            caps.append("vision")
+        if requires_function_calling:
+            caps.append("function calling")
+        if caps:
+            parts.append(f"supports {', '.join(caps)}")
+        
+        return "; ".join(parts)
     
     def _calculate_quality_tier(self, price_ratio: float) -> int:
         """

@@ -65,5 +65,5 @@ htmlcov/
 Thumbs.db
 
 tests/
-scripts/
+scripts/__pycache__/
 uploads/

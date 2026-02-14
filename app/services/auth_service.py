@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from ..models.user_models import User, UserSession, ProjectMember, PolicyConsent
+from ..models.db_models import UserMilestone
 from ..models.auth_schemas import (
     UserRegister, UserLogin, UserResponse, TokenResponse,
     SessionInfo, ProfileUpdate, PolicyConsentStatus, PolicyCheckResponse
@@ -51,7 +52,8 @@ EXTENDED_SESSION_DAYS = settings.extended_session_days
 def create_access_token(
     user_id: str,
     email: str,
-    expires_delta: Optional[timedelta] = None
+    expires_delta: Optional[timedelta] = None,
+    reactivated: bool = False
 ) -> Tuple[str, datetime]:
     """
     Create a JWT access token.
@@ -71,6 +73,9 @@ def create_access_token(
         "exp": expire,
         "iat": datetime.now(timezone.utc),
     }
+    
+    if reactivated:
+        payload["grace_period_reactivated"] = True
     
     token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
     return token, expire
@@ -183,6 +188,51 @@ class AuthService:
     
     def __init__(self, db: AsyncSession):
         self.db = db
+
+    # Badge metadata used by both create_user and google_authenticate
+    _BADGE_CONFIG = {
+        "top_20":  (20,   "Top 20 Early Adopter",  "Among the first 20 users to join AgentCost"),
+        "top_50":  (50,   "Top 50 Early Adopter",  "Among the first 50 users to join AgentCost"),
+        "top_100": (100,  "Top 100 Early Adopter", "Among the first 100 users to join AgentCost"),
+        "top_1000":(1000, "Top 1,000 Early Adopter","Among the first 1,000 users to join AgentCost"),
+    }
+
+    def _assign_milestone(self, user: "User") -> None:
+        """
+        Set ``milestone_badge`` on *user* and create an immutable
+        ``UserMilestone`` record for the signup position.
+
+        Superusers (admins) are excluded
+        """
+        number = user.user_number
+        if not number:
+            return
+
+        # Admins/superusers must never get badges or milestones
+        if getattr(user, 'is_superuser', False):
+            return
+
+        badge = None
+        if number <= 20:
+            badge = "top_20"
+        elif number <= 50:
+            badge = "top_50"
+        elif number <= 100:
+            badge = "top_100"
+        elif number <= 1000:
+            badge = "top_1000"
+
+        user.milestone_badge = badge
+
+        if badge:
+            _, name, description = self._BADGE_CONFIG[badge]
+            self.db.add(UserMilestone(
+                user_id=user.id,
+                milestone_type="signup_position",
+                milestone_name=name,
+                milestone_description=description,
+                metadata_json={"user_number": number, "badge": badge},
+            ))
     
     async def get_user_by_email(self, email: str) -> Optional[User]:
         """Get user by email address"""
@@ -190,6 +240,43 @@ class AuthService:
             select(User).where(User.email == email.lower())
         )
         return result.scalar_one_or_none()
+    
+    async def _assign_user_number(self, user: User, max_retries: int = 3) -> None:
+        """
+        Assign a sequential user_number, with retry logic to handle
+        race conditions where two concurrent registrations read the
+        same MAX(user_number) before either commits.
+        """
+        for attempt in range(max_retries):
+            max_num_query = select(
+                sa_func.coalesce(sa_func.max(User.user_number), 0)
+            )
+            max_num = (await self.db.execute(max_num_query)).scalar() or 0
+            user.user_number = max_num + 1
+            try:
+                await self.db.flush()
+                return  # Success
+            except IntegrityError as e:
+                error_msg = str(e).lower()
+                # If the collision is on user_number, retry with next number
+                if "user_number" in error_msg or "uq_" in error_msg:
+                    await self.db.rollback()
+                    # Re-add the user to the session after rollback
+                    self.db.add(user)
+                    # Reset stale user_number before next iteration reads MAX again
+                    user.user_number = None
+                    logger.warning(
+                        f"user_number collision on attempt {attempt + 1}, retrying"
+                    )
+                    continue
+                # Not a user_number collision — re-raise
+                raise
+        # All retries exhausted — assign with a larger gap to avoid further collisions
+        max_num = (await self.db.execute(
+            select(sa_func.coalesce(sa_func.max(User.user_number), 0))
+        )).scalar() or 0
+        user.user_number = max_num + 1
+        await self.db.flush()
     
     async def get_user_by_id(self, user_id: str) -> Optional[User]:
         """Get user by ID"""
@@ -253,22 +340,11 @@ class AuthService:
             self.db.add(user)
             await self.db.flush()  # Get user ID without committing
 
-            # Assign sequential user_number with row-level locking to prevent race conditions
-            max_num_query = select(
-                sa_func.coalesce(sa_func.max(User.user_number), 0)
-            ).with_for_update()
-            max_num = (await self.db.execute(max_num_query)).scalar() or 0
-            user.user_number = max_num + 1
+            # Assign sequential user_number with retry logic for race conditions
+            await self._assign_user_number(user)
 
-            # Auto-assign milestone badge based on signup position
-            if user.user_number <= 20:
-                user.milestone_badge = "top_20"
-            elif user.user_number <= 50:
-                user.milestone_badge = "top_50"
-            elif user.user_number <= 100:
-                user.milestone_badge = "top_100"
-            elif user.user_number <= 1000:
-                user.milestone_badge = "top_1000"
+            # Assign milestone badge and create UserMilestone record
+            self._assign_milestone(user)
             
             # Record consent for Terms of Service
             terms_consent = PolicyConsent(
@@ -393,6 +469,34 @@ class AuthService:
         )
         return result.scalar_one_or_none()
     
+    async def _reactivate_user(self, user: User) -> None:
+        """Reactivate a soft-deleted user if within grace period."""
+        user.is_deleted = False
+        user.deleted_at = None
+        user.is_active = True
+        
+        self.db.add(user)
+        # Flush to ensure DB knows about changes, commit happens at request end
+        await self.db.flush()
+
+    def _is_within_grace_period(self, user: User) -> bool:
+        """Check if deleted user is still within grace period."""
+        if not user.deleted_at:
+            return False
+            
+        settings = get_settings()
+        grace_days = settings.deletion_grace_days
+        
+        # Ensure deleted_at is timezone-aware (assume UTC if naive)
+        # SQLite/SQLAlchemy might strip timezone info
+        deleted_at = user.deleted_at
+        if deleted_at.tzinfo is None:
+            deleted_at = deleted_at.replace(tzinfo=timezone.utc)
+            
+        cutoff = deleted_at + timedelta(days=grace_days)
+        
+        return datetime.now(timezone.utc) < cutoff
+
     async def authenticate_user(
         self,
         email: str,
@@ -408,6 +512,16 @@ class AuthService:
         
         if not user:
             return None
+        
+        # Soft-deleted users: check grace period
+        reactivated = False
+        if getattr(user, 'is_deleted', False):
+            if self._is_within_grace_period(user):
+                await self._reactivate_user(user)
+                # Mark for token generation
+                user.grace_period_reactivated = True
+            else:
+                return None
         
         # Google-only users cannot log in with password
         if not user.password_hash:
@@ -460,6 +574,14 @@ class AuthService:
         user = result.scalar_one_or_none()
         
         if user:
+            # Soft-deleted users: check grace period
+            if getattr(user, 'is_deleted', False):
+                if self._is_within_grace_period(user):
+                    await self._reactivate_user(user)
+                    user.grace_period_reactivated = True
+                else:
+                    raise ValueError("This account has been deleted. Please contact support.")
+            
             if not user.is_active:
                 raise ValueError("This account has been deactivated. Please contact support.")
             # Update avatar if Google provides a new one
@@ -471,6 +593,13 @@ class AuthService:
         user = await self.get_user_by_email(email)
         
         if user:
+            if getattr(user, 'is_deleted', False):
+                if self._is_within_grace_period(user):
+                    await self._reactivate_user(user)
+                    user.grace_period_reactivated = True
+                else:
+                    raise ValueError("This account has been deleted. Please contact support.")
+
             if not user.is_active:
                 raise ValueError("This account has been deactivated. Please contact support.")
             
@@ -513,22 +642,11 @@ class AuthService:
             self.db.add(user)
             await self.db.flush()
             
-            # Assign sequential user_number
-            max_num_query = select(
-                sa_func.coalesce(sa_func.max(User.user_number), 0)
-            ).with_for_update()
-            max_num = (await self.db.execute(max_num_query)).scalar() or 0
-            user.user_number = max_num + 1
+            # Assign sequential user_number with retry logic for race conditions
+            await self._assign_user_number(user)
             
-            # Assign milestone badge
-            if user.user_number <= 20:
-                user.milestone_badge = "top_20"
-            elif user.user_number <= 50:
-                user.milestone_badge = "top_50"
-            elif user.user_number <= 100:
-                user.milestone_badge = "top_100"
-            elif user.user_number <= 1000:
-                user.milestone_badge = "top_1000"
+            # Assign milestone badge and create UserMilestone record
+            self._assign_milestone(user)
             
             # Record consent for Terms of Service
             terms_consent = PolicyConsent(
@@ -589,7 +707,8 @@ class AuthService:
         """
         access_token, access_expires = create_access_token(
             user_id=user.id,
-            email=user.email
+            email=user.email,
+            reactivated=getattr(user, 'grace_period_reactivated', False)
         )
         
         refresh_token, refresh_expires = create_refresh_token(

@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timezone
+import asyncio
 
 from .config import get_settings
 from .database import create_tables, get_db_session
@@ -45,6 +46,10 @@ async def lifespan(app: FastAPI):
     upload_dir = Path(settings.upload_dir).resolve()
     upload_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Upload directory: %s", upload_dir)
+
+    # Start background cron jobs
+    from .services.cron import cron_loop
+    cron_task = asyncio.create_task(cron_loop())
     
     # Optional: Auto-sync pricing on startup
     if settings.auto_sync_pricing_on_startup:
@@ -117,6 +122,11 @@ async def lifespan(app: FastAPI):
     
     # Shutdown
     logger.info("Shutting down AgentCost Backend...")
+    cron_task.cancel()
+    try:
+        await cron_task
+    except asyncio.CancelledError:
+        pass
 
 
 # Create FastAPI app
