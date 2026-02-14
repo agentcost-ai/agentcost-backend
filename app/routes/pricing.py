@@ -136,7 +136,7 @@ async def get_sync_status(db: AsyncSession = Depends(get_db)):
     # Determine status message based on model count
     if total_models == 0:
         status = "not_synced"
-        message = "No models in database. Run POST /v1/pricing/sync/litellm to sync 1600+ models."
+        message = "No models in database. Run POST /v1/pricing/sync/litellm to sync 1900+ models."
     elif total_models < 100:
         status = "partial"
         message = f"Only {total_models} models synced. Run POST /v1/pricing/sync/litellm for full sync."
@@ -401,7 +401,7 @@ async def generate_alternatives(
     """
     Auto-generate model alternatives by analyzing pricing data.
     
-    This analyzes all 2000+ models in the pricing table and creates
+    This analyzes all 1900+ models in the pricing table and creates
     alternatives based on:
     - Same provider models (safer swaps)
     - Cross-provider models (for expensive models)
