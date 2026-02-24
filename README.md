@@ -9,7 +9,7 @@ cd agentcost-backend
 pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
-Interactive docs at `https://agentcost.tech/docs/sdk`
+Interactive API docs (Swagger UI) at `http://localhost:8000/docs`
 
 ## Project Structure
 
@@ -34,13 +34,23 @@ agentcost-backend/
 │   │   ├── attachments.py   # File upload/download
 │   │   └── admin/           # Admin platform management
 │   ├── services/
-│   │   ├── auth_service.py      # Authentication business logic
-│   │   ├── member_service.py    # Project membership logic
-│   │   ├── event_service.py     # Event processing
-│   │   ├── analytics_service.py # Analytics queries
-│   │   └── optimization_service.py # Optimization engine
+│   │   ├── auth_service.py          # Authentication business logic
+│   │   ├── member_service.py        # Project membership logic
+│   │   ├── event_service.py         # Event processing
+│   │   ├── analytics_service.py     # Analytics queries
+│   │   ├── optimization_service.py  # Optimization engine
+│   │   ├── pricing_service.py       # Dynamic model pricing
+│   │   ├── admin_service.py         # Admin platform logic
+│   │   ├── email_service.py         # Transactional email (Resend)
+│   │   ├── permission_service.py    # Role-based access control
+│   │   ├── storage_service.py       # File storage
+│   │   ├── baseline_service.py      # Cost baseline tracking
+│   │   ├── alternative_learning_service.py # Model alternative suggestions
+│   │   └── cron.py                  # Background cron jobs
 │   └── utils/
-│       └── auth.py          # API key validation
+│       ├── auth.py          # API key validation
+│       ├── rate_limiter.py  # Request rate limiting middleware
+│       └── request_size.py  # Request size limit middleware
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
