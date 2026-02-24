@@ -29,6 +29,28 @@ PROVIDER_PREFIXES = {
     "fireworks_ai/": "fireworks",
     "azure/": "azure",
     "bedrock/": "aws",
+    "xai/": "xai",
+    "perplexity/": "perplexity",
+    "replicate/": "replicate",
+    "cerebras/": "cerebras",
+    "deepinfra/": "deepinfra",
+    "sambanova/": "sambanova",
+    "ai21/": "ai21",
+    "novita/": "novita",
+}
+
+# Providers whose models use canonical names (strip prefix for dedup).
+# Platform/hosting providers keep the prefix to preserve separate pricing.
+CANONICAL_PROVIDERS = {
+    "openai", "anthropic", "google", "gemini", "groq", "mistral",
+    "cohere", "deepseek", "together_ai", "xai", "perplexity", "replicate",
+    "ai21", "cerebras", "deepinfra", "fireworks_ai", "novita", "sambanova",
+    "moonshot", "minimax", "dashscope", "nlp_cloud",
+}
+
+PLATFORM_PROVIDERS = {
+    "azure", "azure_ai", "bedrock", "bedrock_converse",
+    "vertex_ai", "sagemaker",
 }
 
 
@@ -172,8 +194,11 @@ class PricingService:
             litellm_provider = model_data.get("litellm_provider")
             if litellm_provider:
                 provider = self._normalize_provider(litellm_provider)
-                # Keep the full model key as the name for uniqueness
-                model_name = model_key
+                # Canonicalize: strip provider prefix for primary providers to
+                # prevent duplicates with OpenRouter (which always strips).
+                # Platform providers (azure, bedrock, vertex_ai) keep the prefix
+                # because their pricing differs from the canonical provider.
+                model_name = self._canonicalize_model_name(model_key, litellm_provider)
             else:
                 model_name, provider = self._parse_litellm_model_key(model_key)
             
@@ -311,9 +336,18 @@ class PricingService:
             model_name = model_id.split("/")[-1] if "/" in model_id else model_id
             context_length = model_data.get("context_length")
             
+            # Check for existing record by canonical (stripped) name
             query = select(ModelPricing).where(ModelPricing.model_name == model_name)
             result = await self.db.execute(query)
             existing = result.scalar_one_or_none()
+            
+            # Also check if the full model_id exists (from LiteLLM platform providers)
+            if not existing and "/" in model_id:
+                full_query = select(ModelPricing).where(ModelPricing.model_name == model_id)
+                full_result = await self.db.execute(full_query)
+                if full_result.scalar_one_or_none():
+                    # Model exists under its full platform key; skip to avoid duplicate
+                    continue
             
             if existing:
                 if existing.pricing_source != "litellm":
@@ -347,6 +381,30 @@ class PricingService:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     
+    def _canonicalize_model_name(self, model_key: str, litellm_provider: str) -> str:
+        """Canonicalize model name by stripping provider prefix for primary providers.
+        
+        Primary providers (openai, anthropic, etc.) get their prefix stripped so that
+        'openai/gpt-4o-2024-11-20' becomes 'gpt-4o-2024-11-20', matching what SDKs
+        report and what OpenRouter stores.
+        
+        Platform providers (azure, bedrock, vertex_ai) keep the full key because
+        their pricing differs from the base provider.
+        """
+        if "/" not in model_key:
+            return model_key
+        
+        provider_lower = litellm_provider.lower()
+        
+        # Platform providers: keep the full key for distinct pricing
+        for platform in PLATFORM_PROVIDERS:
+            if provider_lower.startswith(platform):
+                return model_key
+        
+        # Primary providers: strip the prefix
+        _prefix, _, base_name = model_key.partition("/")
+        return base_name if base_name else model_key
+    
     def _parse_litellm_model_key(self, model_key: str) -> Tuple[str, str]:
         """Parse model key into (name, provider)."""
         for prefix, prov in PROVIDER_PREFIXES.items():
@@ -359,83 +417,56 @@ class PricingService:
         
         return (model_key, "unknown")
     
+    # Only platform prefixes that remap to a different canonical name.
+    # Everything else is derived dynamically from the raw provider string.
+    _PLATFORM_REMAP = {
+        "vertex_ai": "google",
+        "bedrock": "aws",
+        "bedrock_converse": "aws",
+        "azure": "azure",
+        "azure_ai": "azure",
+        "sagemaker": "aws",
+        "text-completion-openai": "openai",
+        "palm": "google",
+        "gemini": "google",
+        "watsonx": "ibm",
+        "oci": "oracle",
+    }
+
     def _normalize_provider(self, litellm_provider: str) -> str:
-        """Normalize litellm_provider to a clean provider name."""
-        provider_lower = litellm_provider.lower()
+        """Normalize litellm_provider to a clean, lowercase provider name.
         
-        # Handle vertex_ai-* patterns (e.g., vertex_ai-anthropic_models -> google)
-        # All vertex_ai models are served via Google Cloud, so normalize to google
-        if provider_lower.startswith("vertex_ai"):
-            return "google"
+        Strategy (no hardcoded map of every provider):
+        1. Exact match in _PLATFORM_REMAP → use the remapped name.
+        2. Prefix match in _PLATFORM_REMAP (e.g. 'vertex_ai-anthropic_models') → remap.
+        3. Otherwise: strip common suffixes (_ai, _chat), replace separators, lowercase.
+           This lets any new provider LiteLLM adds flow through automatically.
+        """
+        raw = litellm_provider.strip()
+        if not raw:
+            return "unknown"
         
-        # Handle bedrock_* patterns (e.g., bedrock_converse -> aws)
-        if provider_lower.startswith("bedrock"):
-            return "aws"
+        lower = raw.lower()
         
-        # Handle azure_* patterns
-        if provider_lower.startswith("azure"):
-            return "azure"
+        # 1. Exact remap
+        if lower in self._PLATFORM_REMAP:
+            return self._PLATFORM_REMAP[lower]
         
-        # Handle fireworks_ai-* patterns
-        if provider_lower.startswith("fireworks_ai"):
-            return "fireworks"
+        # 2. Prefix remap (e.g. vertex_ai-anthropic_models, bedrock_converse, azure_ai)
+        for prefix, remapped in self._PLATFORM_REMAP.items():
+            if lower.startswith(prefix + "-") or lower.startswith(prefix + "_"):
+                return remapped
         
-        # Handle cohere_* patterns
-        if provider_lower.startswith("cohere"):
-            return "cohere"
-        
-        # Handle text-completion-openai
-        if provider_lower == "text-completion-openai":
-            return "openai"
-        
-        provider_map = {
-            "openai": "openai",
-            "anthropic": "anthropic",
-            "google": "google",
-            "gemini": "google",
-            "groq": "groq",
-            "mistral": "mistral",
-            "deepseek": "deepseek",
-            "together_ai": "together",
-            "replicate": "replicate",
-            "openrouter": "openrouter",
-            "perplexity": "perplexity",
-            "xai": "xai",
-            "novita": "novita",
-            "vercel_ai_gateway": "vercel",
-            "gradient_ai": "gradient",
-            "amazon-nova": "amazon",
-            "amazon_nova": "amazon",
-            "anyscale": "anyscale",
-            "cerebras": "cerebras",
-            "cloudflare": "cloudflare",
-            "dashscope": "dashscope",
-            "databricks": "databricks",
-            "deepinfra": "deepinfra",
-            "friendliai": "friendliai",
-            "gmi": "gmi",
-            "hyperbolic": "hyperbolic",
-            "jina_ai": "jina",
-            "lambda_ai": "lambda",
-            "llamagate": "llamagate",
-            "minimax": "minimax",
-            "moonshot": "moonshot",
-            "morph": "morph",
-            "nlp_cloud": "nlp_cloud",
-            "nscale": "nscale",
-            "oci": "oracle",
-            "ovhcloud": "ovhcloud",
-            "palm": "google",
-            "sambanova": "sambanova",
-            "v0": "vercel",
-            "voyage": "voyage",
-            "wandb": "wandb",
-            "watsonx": "ibm",
-            "zai": "zai",
-            "ai21": "ai21",
-            "aleph_alpha": "aleph_alpha",
-        }
-        return provider_map.get(provider_lower, provider_lower)
+        # 3. Dynamic cleanup — derive from the raw string.
+        #    'together_ai' → 'together', 'fireworks_ai' → 'fireworks',
+        #    'jina_ai' → 'jina', 'lambda_ai' → 'lambda',
+        #    'gradient_ai' → 'gradient', etc.
+        #    Anything not matching a suffix rule passes through unchanged.
+        name = lower.split("-")[0].split("_")  # split on both - and _
+        # Remove trailing tokens that are generic qualifiers
+        while len(name) > 1 and name[-1] in ("ai", "chat", "models", "gateway"):
+            name.pop()
+        return "_".join(name)
     
     async def _get_model_record(self, model_name: str) -> Optional[ModelPricing]:
         """Get a ModelPricing record by name."""
