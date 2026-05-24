@@ -19,7 +19,7 @@ from ..models.schemas import (
 )
 from ..models.db_models import Project
 from ..services.analytics_service import AnalyticsService
-from ..utils.auth import validate_api_key
+from ..utils.auth import validate_project_access
 
 router = APIRouter(prefix="/v1/analytics", tags=["Analytics"])
 
@@ -49,7 +49,7 @@ def parse_time_range(range_str: str) -> tuple[datetime, datetime]:
 async def get_overview(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get overview metrics for the project.
@@ -67,7 +67,7 @@ async def get_agent_stats(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
     limit: int = Query(10, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get per-agent statistics.
@@ -85,7 +85,7 @@ async def get_model_stats(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
     limit: int = Query(10, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get per-model statistics.
@@ -103,7 +103,7 @@ async def get_timeseries(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
     granularity: Literal["hour", "day"] = Query("day", description="Granularity: hour, day"),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get time series data.
@@ -120,7 +120,7 @@ async def get_timeseries(
 async def get_full_analytics(
     days: int = Query(7, ge=1, le=90),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get complete analytics response.

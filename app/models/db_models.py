@@ -33,7 +33,15 @@ class Project(Base):
     
     owner_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     is_active = Column(Boolean, default=True)
-    
+    # NOTE: ``monthly_budget_usd`` stores the budget amount in the project's
+    # chosen ``budget_currency`` (column name kept for backward compatibility).
+    # Cost events are always reported in USD; BudgetService converts via
+    # CurrencyService at evaluation time.
+    monthly_budget_usd = Column(Float, nullable=True)
+    budget_alert_thresholds = Column(JSON, nullable=True)
+    budget_enforcement_mode = Column(String(20), nullable=False, default="off")
+    budget_currency = Column(String(3), nullable=False, default="USD")
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
@@ -143,7 +151,7 @@ class ModelPricing(Base):
     """
     Dynamic model pricing table.
     
-    Stores pricing for 1900+ models synced from LiteLLM.
+    Stores pricing for 2000+ models synced from LiteLLM.
     SDK fetches latest prices from this table via /v1/pricing endpoint.
     """
     
@@ -292,6 +300,84 @@ class OptimizationRecommendation(Base):
     
     def __repr__(self):
         return f"<OptimizationRecommendation {self.recommendation_type} - {self.title[:30]}>"
+
+
+class BudgetThresholdAlert(Base):
+    """
+    Stores deduplicated budget threshold crossings per project and month.
+    """
+
+    __tablename__ = "budget_threshold_alerts"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=False)
+
+    # Monthly period key in UTC, e.g. "2026-03"
+    period_key = Column(String(7), nullable=False)
+    threshold_percent = Column(Float, nullable=False)
+
+    spent_amount = Column(Float, nullable=False)
+    budget_amount = Column(Float, nullable=False)
+    utilization_percent = Column(Float, nullable=False)
+
+    triggered_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_budget_alerts_project_time", "project_id", "triggered_at"),
+        Index(
+            "uq_budget_alerts_project_period_threshold",
+            "project_id",
+            "period_key",
+            "threshold_percent",
+            unique=True,
+        ),
+    )
+
+    def __repr__(self):
+        return (
+            f"<BudgetThresholdAlert {self.project_id} {self.period_key} "
+            f"{self.threshold_percent}%>"
+        )
+
+
+class Notification(Base):
+    """
+    Per-user in-app notification.
+
+    Used for budget alerts, member invitations, and other user-facing events.
+    Deletion is cascade-tied to the recipient user.
+    """
+
+    __tablename__ = "notifications"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    user_id = Column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+
+    # Coarse category, e.g. "budget_threshold", "budget_hard_cap", "member_invite".
+    type = Column(String(50), nullable=False)
+    severity = Column(String(20), nullable=False, default="info")  # info, warning, critical
+
+    title = Column(String(255), nullable=False)
+    body = Column(Text, nullable=True)
+    link = Column(String(512), nullable=True)
+
+    # Optional project association so the UI can filter / link to the project.
+    project_id = Column(String(36), ForeignKey("projects.id", ondelete="CASCADE"), nullable=True)
+
+    # Free-form payload for clients that want richer context (utilization %, etc.).
+    payload = Column(JSON, nullable=True)
+
+    is_read = Column(Boolean, default=False, nullable=False)
+    read_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_notifications_user_created", "user_id", "created_at"),
+        Index("idx_notifications_user_unread", "user_id", "is_read"),
+    )
+
+    def __repr__(self):
+        return f"<Notification {self.type} for {self.user_id} read={self.is_read}>"
 
 
 class ProjectBaseline(Base):

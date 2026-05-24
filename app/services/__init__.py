@@ -13,6 +13,8 @@ from .baseline_service import (
     PatternAnalysisService,
     RecommendationTrackingService,
 )
+from .budget_service import BudgetService
+from .notification_service import NotificationService
 
 __all__ = [
     "EventService",
@@ -23,4 +25,6 @@ __all__ = [
     "BaselineService",
     "PatternAnalysisService",
     "RecommendationTrackingService",
+    "BudgetService",
+    "NotificationService",
 ]

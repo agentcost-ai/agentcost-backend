@@ -107,6 +107,26 @@ async def _apply_column_migrations(conn):
         migrations = []
 
         desired = {
+            "projects": {
+                "monthly_budget_usd": {"type": "FLOAT"},
+                "budget_alert_thresholds": {"type": "JSON"},
+                "budget_enforcement_mode": {
+                    "type": "VARCHAR(20)",
+                    "default": "'off'",
+                    "nullable": False,
+                },
+                "budget_currency": {
+                    "type": "VARCHAR(3)",
+                    "default": "'USD'",
+                    "nullable": False,
+                },
+            },
+            "events": {
+                # Track where the cost figure came from (database / defaults / client-sdk)
+                "cost_source": {"type": "VARCHAR(50)"},
+                # SHA256 of normalized input for caching pattern detection
+                "input_hash": {"type": "VARCHAR(64)"},
+            },
             "users": {
                 "admin_notes":    {"type": "TEXT"},
                 "user_number":    {"type": "INTEGER"},

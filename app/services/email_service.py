@@ -20,6 +20,7 @@ from .email_templates import (
     get_admin_direct_email_html,
     get_welcome_email_html,
     get_account_deletion_email_html,
+    get_budget_alert_email_html,
 )
 
 settings = get_settings()
@@ -225,6 +226,46 @@ async def send_account_deletion_email(
         "Action Required: Account Deletion Scheduled", 
         html
     )
+
+
+async def send_budget_alert_email(
+    email: str,
+    *,
+    project_name: str,
+    threshold_percent: float,
+    utilization_percent: float,
+    spent_amount: float,
+    budget_amount: float,
+    period_key: str,
+    enforcement_mode: str,
+    recipient_name: Optional[str] = None,
+    currency: str = "USD",
+) -> bool:
+    """Notify a project owner / admin about a crossed budget threshold."""
+    dashboard_link = f"{FRONTEND_URL}/settings"
+    is_cap = enforcement_mode.lower() == "hard_cap" and utilization_percent >= 100
+
+    if is_cap:
+        subject = f"[AgentCost] Budget hard cap reached for {project_name}"
+    else:
+        subject = (
+            f"[AgentCost] {int(round(threshold_percent))}% budget threshold "
+            f"crossed for {project_name}"
+        )
+
+    html = get_budget_alert_email_html(
+        project_name=project_name,
+        threshold_percent=threshold_percent,
+        utilization_percent=utilization_percent,
+        spent_amount=spent_amount,
+        budget_amount=budget_amount,
+        period_key=period_key,
+        enforcement_mode=enforcement_mode,
+        dashboard_link=dashboard_link,
+        recipient_name=recipient_name,
+        currency=currency,
+    )
+    return await _send_async(email, subject, html)
 
 
 def send_admin_email(to: str, subject: str, body: str) -> bool:

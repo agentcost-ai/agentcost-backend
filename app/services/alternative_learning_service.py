@@ -2,7 +2,7 @@
 AgentCost Backend - Alternative Learning Service
 
 Auto-generates and learns model alternatives from:
-1. Pricing data similarities (1900+ models)
+1. Pricing data similarities (2000+ models)
 2. Recommendation outcomes (implemented/dismissed)
 3. User feedback patterns
 

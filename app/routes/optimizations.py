@@ -17,7 +17,7 @@ from ..services.baseline_service import (
     PatternAnalysisService,
     RecommendationTrackingService,
 )
-from ..utils.auth import validate_api_key
+from ..utils.auth import validate_project_access
 
 router = APIRouter(prefix="/v1/optimizations", tags=["Optimizations"])
 
@@ -31,7 +31,7 @@ async def get_optimizations(
     days: int = Query(30, ge=1, le=90, description="Days of history to analyze"),
     include_low_priority: bool = Query(True, description="Include low priority suggestions"),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get cost optimization suggestions for your project.
@@ -58,7 +58,7 @@ async def generate_recommendations(
     days: int = Query(30, ge=1, le=90, description="Days of history to analyze"),
     include_low_priority: bool = Query(True, description="Include low priority suggestions"),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Generate optimization suggestions and persist top recommendations.
@@ -79,7 +79,7 @@ async def generate_recommendations(
 async def get_optimization_summary(
     days: int = Query(30, ge=1, le=90, description="Days of history to analyze"),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get optimization summary with total potential savings.
@@ -99,7 +99,7 @@ async def get_optimization_summary(
 async def refresh_baselines(
     days: int = Query(30, ge=7, le=90, description="Days of history for baseline calculation"),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Refresh statistical baselines for the project.
@@ -117,7 +117,7 @@ async def get_baselines(
     agent_name: Optional[str] = Query(None, description="Filter by agent name"),
     model: Optional[str] = Query(None, description="Filter by model"),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get current statistical baselines for the project.
@@ -167,7 +167,7 @@ async def get_baselines(
 async def get_caching_opportunities(
     min_occurrences: int = Query(5, ge=2, description="Minimum duplicate occurrences"),
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get detailed caching opportunity analysis.
@@ -192,7 +192,7 @@ async def get_caching_opportunities(
 @router.get("/recommendations")
 async def get_pending_recommendations(
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get pending optimization recommendations.
@@ -225,7 +225,7 @@ async def get_pending_recommendations(
 async def mark_recommendation_implemented(
     recommendation_id: str,
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Mark a recommendation as implemented.
@@ -258,7 +258,7 @@ async def dismiss_recommendation(
     recommendation_id: str,
     feedback: RecommendationFeedback = None,
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Dismiss a recommendation with optional feedback.
@@ -289,7 +289,7 @@ async def dismiss_recommendation(
 @router.get("/recommendations/effectiveness")
 async def get_recommendation_effectiveness(
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     Get effectiveness metrics for recommendations.

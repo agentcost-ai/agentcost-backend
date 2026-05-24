@@ -163,6 +163,9 @@ class ProjectResponse(BaseModel):
     api_key: Optional[str] = None
     key_prefix: Optional[str] = None
     is_active: bool
+    monthly_budget_usd: Optional[float] = None
+    budget_enforcement_mode: Optional[str] = "off"
+    budget_alert_thresholds: Optional[List[float]] = None
     created_at: datetime
     
     model_config = ConfigDict(from_attributes=True)
@@ -174,6 +177,84 @@ class ProjectUpdate(BaseModel):
     name: Optional[str] = Field(None, max_length=255)
     description: Optional[str] = None
     is_active: Optional[bool] = None
+
+
+SupportedCurrency = Literal["USD", "INR"]
+
+
+class ProjectBudgetUpdate(BaseModel):
+    """Update project budget settings.
+
+    ``monthly_budget_usd`` accepts the budget amount in ``budget_currency``
+    (the name is retained for backward compatibility with prior clients).
+    """
+
+    monthly_budget_usd: Optional[float] = Field(None, ge=0)
+    budget_enforcement_mode: Literal["off", "warn", "hard_cap"] = "warn"
+    budget_alert_thresholds: List[float] = Field(default_factory=lambda: [50.0, 80.0, 100.0])
+    budget_currency: SupportedCurrency = "USD"
+
+    @field_validator("budget_alert_thresholds")
+    @classmethod
+    def validate_thresholds(cls, values: List[float]) -> List[float]:
+        cleaned: list[float] = []
+        for item in values:
+            if item < 1 or item > 100:
+                raise ValueError("Threshold values must be between 1 and 100")
+            cleaned.append(round(float(item), 2))
+
+        if not cleaned:
+            raise ValueError("At least one threshold is required")
+
+        return sorted(set(cleaned))
+
+
+class ProjectBudgetResponse(BaseModel):
+    """Project budget settings with current utilization snapshot.
+
+    All monetary values are expressed in ``budget_currency``. The raw
+    USD-denominated spend (from event costs) is also returned for clients
+    that want to display it.
+    """
+
+    project_id: str
+    monthly_budget_usd: Optional[float] = None
+    budget_enforcement_mode: Literal["off", "warn", "hard_cap"] = "off"
+    budget_alert_thresholds: List[float]
+    current_month_spend: float
+    current_month_spend_usd: float = 0.0
+    utilization_percent: Optional[float] = None
+    period_key: str
+    budget_currency: SupportedCurrency = "USD"
+    fx_rate: float = 1.0
+
+
+class NotificationResponse(BaseModel):
+    """A single in-app notification."""
+
+    id: str
+    type: str
+    severity: Literal["info", "warning", "critical"] = "info"
+    title: str
+    body: Optional[str] = None
+    link: Optional[str] = None
+    project_id: Optional[str] = None
+    payload: Optional[Dict[str, Any]] = None
+    is_read: bool
+    read_at: Optional[datetime] = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class NotificationListResponse(BaseModel):
+    items: List[NotificationResponse]
+    total: int
+    unread_count: int
+
+
+class NotificationCountResponse(BaseModel):
+    unread_count: int
 
 
 class HealthResponse(BaseModel):

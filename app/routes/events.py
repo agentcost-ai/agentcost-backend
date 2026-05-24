@@ -12,7 +12,8 @@ from ..database import get_db
 from ..models.schemas import EventBatchRequest, EventBatchResponse, EventResponse
 from ..models.db_models import Project
 from ..services.event_service import EventService
-from ..utils.auth import validate_api_key
+from ..services.budget_service import BudgetService
+from ..utils.auth import validate_api_key, validate_project_access
 from ..config import get_settings
 
 router = APIRouter(prefix="/v1/events", tags=["Events"])
@@ -44,6 +45,18 @@ async def ingest_events_batch(
             status_code=403,
             detail="Project ID does not match API key.",
         )
+
+    budget_service = BudgetService(db)
+    incoming_cost = sum(max(float(event.cost), 0.0) for event in request.events)
+    budget_eval = await budget_service.evaluate(project, additional_cost=incoming_cost)
+    if budget_eval.get("should_block"):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Monthly budget hard cap reached. Increase your budget or switch "
+                "budget mode to 'warn' to continue ingesting events."
+            ),
+        )
     
     try:
         # Store events
@@ -52,6 +65,19 @@ async def ingest_events_batch(
             project_id=project.id,
             events=request.events,
         )
+
+        # Record newly crossed thresholds for this month (deduplicated).
+        # Fan-out to in-app notifications + email for owners/admins.
+        if budget_eval.get("enabled") and budget_eval.get("crossed_thresholds"):
+            await budget_service.record_threshold_crossings(
+                project_id=project.id,
+                period_key=budget_eval["period_key"],
+                crossed_thresholds=budget_eval["crossed_thresholds"],
+                spent_amount=budget_eval["projected_spend"],
+                budget_amount=budget_eval["budget"],
+                utilization_percent=budget_eval["utilization_percent"],
+                project=project,
+            )
         
         return EventBatchResponse(
             status="ok",
@@ -77,7 +103,7 @@ async def list_events(
     agent_name: str = None,
     model: str = None,
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """
     List events for a project.
@@ -99,7 +125,7 @@ async def list_events(
 @router.get("/count")
 async def get_event_count(
     db: AsyncSession = Depends(get_db),
-    project: Project = Depends(validate_api_key),
+    project: Project = Depends(validate_project_access),
 ):
     """Get total event count for project."""
     event_service = EventService(db)

@@ -421,15 +421,20 @@ async def get_me(
     Requires authentication.
     Also updates last_active_at to track user activity (debounced to 5 mins).
     """
-    # Update last_active_at at most once every 5 minutes to reduce write load
+    # Update last_active_at at most once every 5 minutes to reduce write load.
+    # Some Postgres rows may have naive timestamps (legacy TIMESTAMP column
+    # without time zone), so normalize to UTC-aware before subtracting.
     now = datetime.now(timezone.utc)
     should_update = True
-    
+
     if user.last_active_at:
-        elapsed = (now - user.last_active_at).total_seconds()
+        last = user.last_active_at
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        elapsed = (now - last).total_seconds()
         if elapsed < 300:  # 5 minutes
             should_update = False
-            
+
     if should_update:
         user.last_active_at = now
         await db.commit()

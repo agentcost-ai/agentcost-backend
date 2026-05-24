@@ -17,6 +17,8 @@ from .routes import (
     pricing_router,
     feedback_router,
     attachments_router,
+    notifications_router,
+    currency_router,
 )
 from .routes.auth import router as auth_router
 from .routes.members import router as members_router
@@ -162,6 +164,8 @@ app.include_router(optimizations_router)
 app.include_router(pricing_router)
 app.include_router(feedback_router)
 app.include_router(attachments_router)
+app.include_router(notifications_router)
+app.include_router(currency_router)
 app.include_router(admin_router)
 
 

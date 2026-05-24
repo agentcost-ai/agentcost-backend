@@ -262,11 +262,55 @@ class ProjectService:
         return project, plaintext_key
     
     async def delete(self, project_id: str) -> bool:
-        """Delete project"""
+        """
+        Delete a project and ALL of its dependent data.
+
+        Several child tables (events, daily_aggregates, optimization
+        recommendations, baselines, input_pattern_cache, model_feedback_*)
+        reference ``projects.id`` without an ON DELETE CASCADE clause —
+        adding cascade DDL post-hoc is fragile across SQLite/Postgres, so
+        we clean them up explicitly here.
+
+        Tables that already have ON DELETE CASCADE on the DB FK
+        (project_members, pending_email_invitations, budget_threshold_alerts,
+        notifications) get cleaned up automatically by the DB; we issue the
+        DELETEs here too for SQLite test parity and to guarantee no orphans
+        on Postgres even if a constraint was added in a non-standard way.
+        """
+        from sqlalchemy import delete as sa_delete
+
+        from ..models.db_models import (
+            BudgetThresholdAlert,
+            DailyAggregate,
+            Event,
+            InputPatternCache,
+            Notification,
+            OptimizationRecommendation,
+            ProjectBaseline,
+        )
+        from ..models.user_models import PendingEmailInvitation, ProjectMember
+
         project = await self.get_by_id(project_id)
         if not project:
             return False
-        
+
+        # Order matters only when a child has its own children — but none of
+        # these tables fan out further, so any order works.
+        for model in (
+            Event,
+            DailyAggregate,
+            OptimizationRecommendation,
+            ProjectBaseline,
+            InputPatternCache,
+            BudgetThresholdAlert,
+            Notification,
+            ProjectMember,
+            PendingEmailInvitation,
+        ):
+            await self.db.execute(
+                sa_delete(model).where(model.project_id == project_id)
+            )
+
         await self.db.delete(project)
         await self.db.flush()
         return True

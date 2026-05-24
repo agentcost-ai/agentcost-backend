@@ -9,7 +9,7 @@ to eliminate duplication across route modules.
 
 import hashlib
 import secrets
-from fastapi import HTTPException, Security, Depends, status
+from fastapi import HTTPException, Security, Depends, Query, status
 from fastapi.security import APIKeyHeader, HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, Tuple
@@ -17,6 +17,7 @@ from typing import Optional, Tuple
 from ..database import get_db
 from ..services.event_service import ProjectService
 from ..services.auth_service import get_current_user
+from ..services.permission_service import PermissionService, Permission
 from ..models.db_models import Project
 from ..models.user_models import User
 
@@ -119,9 +120,123 @@ async def optional_api_key(
     """
     if not api_key:
         return None
-    
+
     project_service = ProjectService(db)
     return await project_service.get_by_api_key(api_key)
+
+
+async def _resolve_project_access(
+    project_id: Optional[str],
+    api_key: Optional[str],
+    db: AsyncSession,
+) -> Project:
+    """Shared dual-auth resolution logic — see validate_project_access."""
+    # Path 1: SDK API key. sk_ prefix lets us distinguish reliably from JWTs.
+    if api_key and api_key.startswith("sk_"):
+        project_service = ProjectService(db)
+        project = await project_service.get_by_api_key(api_key)
+        if not project:
+            raise HTTPException(status_code=401, detail="Invalid API key.")
+        if not project.is_active:
+            raise HTTPException(status_code=403, detail="Project is disabled.")
+        # When the route also has a path-scoped project_id, ensure it matches.
+        if project_id and project_id != project.id:
+            raise HTTPException(
+                status_code=403,
+                detail="API key does not match the requested project.",
+            )
+        return project
+
+    # Path 2: JWT + project_id. The ``api_key`` variable carries the JWT in
+    # this case (Authorization header is shared between the two paths).
+    if api_key and project_id:
+        user = await get_current_user(db, api_key)
+        if not user:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or expired token.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        permission_service = PermissionService(db)
+        try:
+            await permission_service.require_permission(
+                user.id, project_id, Permission.VIEW_PROJECT
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc))
+
+        project_service = ProjectService(db)
+        project = await project_service.get_by_id(project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found.")
+        if not project.is_active:
+            raise HTTPException(status_code=403, detail="Project is disabled.")
+        return project
+
+    # Neither auth path succeeded.
+    if api_key and not project_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "When authenticating with a session token, the project_id "
+                "query parameter is required."
+            ),
+        )
+    raise HTTPException(
+        status_code=401,
+        detail=(
+            "Authentication required: provide either an SDK API key "
+            "(Authorization: Bearer sk_…) or a session token plus project_id."
+        ),
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def validate_project_access(
+    project_id: Optional[str] = Query(
+        None,
+        description=(
+            "Project ID. Required for JWT-authenticated requests; ignored "
+            "for SDK API-key requests (the project is derived from the key)."
+        ),
+    ),
+    api_key: Optional[str] = Depends(get_api_key),
+    db: AsyncSession = Depends(get_db),
+) -> Project:
+    """
+    Dual-auth dependency for project-scoped read endpoints (no path id).
+
+    Use this on routes like ``/v1/analytics/overview`` where ``project_id``
+    arrives as a query parameter. For routes that already have ``project_id``
+    in their path (``/v1/projects/{project_id}``), use
+    :func:`validate_project_access_for_path_id` instead to avoid FastAPI's
+    "path vs query" parameter conflict.
+
+    Resolution rules:
+
+    1. **API-key path** — if the Authorization header carries an ``sk_`` API
+       key, validate it and return the project it belongs to. The query
+       ``project_id`` is ignored except as a safety check.
+    2. **JWT path** — if the Authorization header carries a JWT,
+       ``project_id`` must be provided and the caller must have
+       ``VIEW_PROJECT`` permission on that project.
+    """
+    return await _resolve_project_access(project_id, api_key, db)
+
+
+async def validate_project_access_for_path_id(
+    project_id: str,  # resolved from the route's path parameter
+    api_key: Optional[str] = Depends(get_api_key),
+    db: AsyncSession = Depends(get_db),
+) -> Project:
+    """
+    Dual-auth variant for routes whose URL already contains ``project_id``
+    as a path parameter (``/v1/projects/{project_id}``). Same authentication
+    rules as :func:`validate_project_access`; project_id is read from the
+    path instead of a query parameter.
+    """
+    return await _resolve_project_access(project_id, api_key, db)
 
 
 # Shared JWT user dependencies

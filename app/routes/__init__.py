@@ -9,6 +9,8 @@ from .optimizations import router as optimizations_router
 from .pricing import router as pricing_router
 from .feedback import router as feedback_router
 from .attachments import router as attachments_router
+from .notifications import router as notifications_router
+from .currency import router as currency_router
 
 __all__ = [
     "events_router",
@@ -18,4 +20,6 @@ __all__ = [
     "pricing_router",
     "feedback_router",
     "attachments_router",
+    "notifications_router",
+    "currency_router",
 ]
