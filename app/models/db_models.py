@@ -693,3 +693,44 @@ class UserMilestone(Base):
 
     def __repr__(self):
         return f"<UserMilestone {self.milestone_type} for {self.user_id}>"
+
+
+class DemoSession(Base):
+    """
+    Anonymous demo-mode usage tracking.
+
+    One row per demo session (browser-generated UUID). The demo itself runs
+    entirely client-side; the dashboard fire-and-forgets pings here so the
+    admin panel can report demo adoption and demo -> signup conversion.
+    No PII is stored beyond a referrer string and user agent.
+    """
+
+    __tablename__ = "demo_sessions"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    # Client-generated session id (UUID from localStorage).
+    session_id = Column(String(64), unique=True, nullable=False)
+
+    # Where the visitor entered the demo from (hero, navbar, login, direct...).
+    source = Column(String(50), nullable=True)
+    referrer = Column(String(512), nullable=True)
+    user_agent = Column(String(512), nullable=True)
+
+    page_views = Column(Integer, default=0, nullable=False)
+    # Pages visited, e.g. ["/dashboard", "/optimizations"].
+    pages = Column(JSON, nullable=True)
+
+    signup_clicked = Column(Boolean, default=False, nullable=False)
+    converted = Column(Boolean, default=False, nullable=False)
+    converted_at = Column(DateTime(timezone=True), nullable=True)
+
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    last_seen_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_demo_sessions_started", "started_at"),
+        Index("idx_demo_sessions_converted", "converted"),
+    )
+
+    def __repr__(self):
+        return f"<DemoSession {self.session_id} views={self.page_views} converted={self.converted}>"

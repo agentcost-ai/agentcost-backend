@@ -14,11 +14,13 @@ mounted at /v1/admin.  Each sub-module owns one domain:
   incidents.py  -- error and incident logs
   feedback.py   -- feedback triage and response
   audit_log.py  -- immutable admin action trail
+  demo.py       -- demo mode usage and conversion analytics
 """
 
 from fastapi import APIRouter
 
 from .auth import router as auth_router
+from .demo import router as demo_router
 from .overview import router as overview_router
 from .users import router as users_router
 from .projects import router as projects_router
@@ -41,3 +43,4 @@ router.include_router(analytics_router)
 router.include_router(incidents_router)
 router.include_router(feedback_router)
 router.include_router(audit_log_router)
+router.include_router(demo_router)

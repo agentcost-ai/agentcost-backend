@@ -23,6 +23,7 @@ from .routes import (
 from .routes.auth import router as auth_router
 from .routes.members import router as members_router
 from .routes.admin import router as admin_router
+from .routes.demo import router as demo_router
 from .models.schemas import HealthResponse
 from .utils.rate_limiter import RateLimitMiddleware
 from .utils.request_size import RequestSizeLimitMiddleware
@@ -167,6 +168,7 @@ app.include_router(attachments_router)
 app.include_router(notifications_router)
 app.include_router(currency_router)
 app.include_router(admin_router)
+app.include_router(demo_router)
 
 
 @app.get("/v1/health", response_model=HealthResponse, tags=["Health"])
