@@ -147,9 +147,148 @@ class AnalyticsResponse(BaseModel):
     timeseries: List[TimeSeriesPoint]
 
 
+# ── Executive Report ──────────────────────────────────────────────────────
+
+
+class MetricDelta(BaseModel):
+    """A headline metric with its prior-period comparison."""
+
+    current: float
+    previous: float
+    change_percent: float  # signed; 0.0 when previous is 0
+    direction: Literal["up", "down", "neutral"]
+
+
+class ReportSummary(BaseModel):
+    """Executive-summary band: KPIs with period-over-period deltas."""
+
+    cost: MetricDelta
+    calls: MetricDelta
+    tokens: MetricDelta
+    success_rate: MetricDelta
+    avg_latency_ms: MetricDelta
+    blended_cost_per_1k: float
+    in_out_ratio: float  # input_tokens / output_tokens
+
+
+class LatencyPercentiles(BaseModel):
+    p50: float
+    p95: float
+    p99: float
+    avg: float
+    sample_size: int
+    approximate: bool = False
+
+
+class ModelEfficiency(BaseModel):
+    model: str
+    cost_per_1k: float
+    in_out_ratio: float
+
+
+class TokenEfficiency(BaseModel):
+    blended_cost_per_1k: float
+    in_out_ratio: float
+    total_input_tokens: int
+    total_output_tokens: int
+    by_model: List[ModelEfficiency]
+
+
+class ParetoInfo(BaseModel):
+    """Cost concentration: how few models drive ≥80% of spend."""
+
+    top_count: int
+    top_share: float  # percent of spend held by top_count models
+    total_models: int
+
+
+class CadenceBucket(BaseModel):
+    label: str
+    index: int
+    calls: int
+    cost: float
+
+
+class UsageCadence(BaseModel):
+    busiest_day: Optional[str] = None
+    busiest_hour: Optional[str] = None
+    by_dow: List[CadenceBucket]
+    by_hour: List[CadenceBucket]
+
+
+class ErrorBreakdownRow(BaseModel):
+    model: str
+    total_calls: int
+    error_count: int
+    error_rate: float  # percent
+
+
+class TopError(BaseModel):
+    error: str
+    count: int
+
+
+class RunRateProjection(BaseModel):
+    daily_avg_cost: float
+    projected_monthly_cost: float
+    window_days: float
+
+
+class BudgetStatus(BaseModel):
+    enabled: bool
+    budget: Optional[float] = None
+    current_spend: float = 0.0
+    projected_spend: float = 0.0
+    utilization_percent: Optional[float] = None
+    currency: str = "USD"
+    fx_rate: float = 1.0
+    mode: str = "off"
+
+
+class SavingsRollup(BaseModel):
+    total_potential_savings_monthly: float = 0.0
+    total_potential_savings_percent: float = 0.0
+    suggestion_count: int = 0
+    high_priority_count: int = 0
+    top_suggestions: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+class ExecutiveReport(BaseModel):
+    """Board-ready cost & usage report: executive summary + deep breakdowns."""
+
+    generated_at: datetime
+    range_label: str
+    period_start: datetime
+    period_end: datetime
+    previous_period_start: datetime
+    previous_period_end: datetime
+    is_custom_range: bool = False
+    project_name: str
+    currency: str = "USD"
+
+    summary: ReportSummary
+    overview: AnalyticsOverview
+    timeseries: List[TimeSeriesPoint]
+
+    models: List[ModelStats]
+    model_pareto: ParetoInfo
+
+    agents: List[AgentStats]
+    agent_cost_share: Dict[str, float]  # agent_name -> percent of spend
+
+    latency: LatencyPercentiles
+    efficiency: TokenEfficiency
+    errors: List[ErrorBreakdownRow]
+    top_errors: List[TopError]
+    cadence: UsageCadence
+    run_rate: RunRateProjection
+    budget: BudgetStatus
+    savings: SavingsRollup
+
+
 class ProjectCreate(BaseModel):
     """Create project request"""
-    
+
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
 
