@@ -53,23 +53,30 @@ async def lifespan(app: FastAPI):
     # Start background cron jobs
     from .services.cron import cron_loop
     cron_task = asyncio.create_task(cron_loop())
-    
-    # Optional: Auto-sync pricing on startup
+
+    # Optional: Auto-sync pricing from LiteLLM. Runs in the BACKGROUND so it
+    # never blocks application startup / port binding — the sync fetches and
+    # upserts ~2,900 models, which can exceed the platform's start timeout and
+    # previously hung the deploy at "Waiting for application startup".
+    pricing_task = None
     if settings.auto_sync_pricing_on_startup:
-        logger.info("Auto-syncing pricing from LiteLLM...")
-        try:
-            async for db in get_db_session():
-                pricing_service = PricingService(db)
-                result = await pricing_service.sync_from_litellm(track_changes=False)
-                await pricing_service.close()
-                logger.info(
-                    "Pricing sync complete: %d created, %d updated",
-                    result.get('models_created', 0),
-                    result.get('models_updated', 0),
-                )
-                break
-        except Exception as e:
-            logger.warning("Pricing sync failed: %s", e)
+        async def _sync_pricing_background():
+            logger.info("Auto-syncing pricing from LiteLLM (background)...")
+            try:
+                async for db in get_db_session():
+                    pricing_service = PricingService(db)
+                    result = await pricing_service.sync_from_litellm(track_changes=False)
+                    await pricing_service.close()
+                    logger.info(
+                        "Pricing sync complete: %d created, %d updated",
+                        result.get("models_created", 0),
+                        result.get("models_updated", 0),
+                    )
+                    break
+            except Exception as e:
+                logger.warning("Pricing sync failed: %s", e)
+
+        pricing_task = asyncio.create_task(_sync_pricing_background())
     
     # Auto-seed superuser from environment variables (for Docker / first-time setup)
     admin_email = os.getenv("ADMIN_EMAIL", "").strip()
@@ -126,10 +133,15 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down AgentCost Backend...")
     cron_task.cancel()
-    try:
-        await cron_task
-    except asyncio.CancelledError:
-        pass
+    if pricing_task:
+        pricing_task.cancel()
+    for task in (cron_task, pricing_task):
+        if task is None:
+            continue
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 # Create FastAPI app
