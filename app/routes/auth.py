@@ -15,9 +15,9 @@ from ..models.auth_schemas import (
     EmailVerificationRequest, ResendVerificationRequest,
     SessionListResponse, SessionInfo, ProfileUpdate,
     RefreshTokenRequest, PolicyCheckResponse, PolicyConsentInput,
-    GoogleAuthRequest
+    GoogleAuthRequest, GitHubAuthRequest
 )
-from ..services.auth_service import AuthService, get_current_user, decode_token, verify_google_id_token
+from ..services.auth_service import AuthService, get_current_user, decode_token, verify_google_id_token, exchange_github_code
 from ..services.email_service import send_verification_email, send_password_reset_email, send_welcome_email
 from ..services.member_service import MemberService
 from ..models.user_models import User
@@ -237,6 +237,96 @@ async def google_auth(
     return await auth_service.login_user(
         user=user,
         remember_me=True,  # Google users get extended session by default
+        device_info=device_info,
+        ip_address=ip_address,
+    )
+
+
+# ============== GitHub OAuth ==============
+
+@router.post("/github", response_model=TokenResponse)
+async def github_auth(
+    data: GitHubAuthRequest,
+    request: Request,
+    auth_service: AuthService = Depends(get_auth_service),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Authenticate or register with GitHub.
+
+    Accepts the authorization code from GitHub's OAuth redirect.
+    - If the user exists, signs them in.
+    - If the user doesn't exist, creates a new account and signs them in.
+
+    GitHub users get auto-verified email and no password is required.
+    """
+    settings = get_settings()
+
+    if not settings.github_client_id or not settings.github_client_secret:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="GitHub sign-in is not configured on this server",
+        )
+
+    # Exchange the code for the user's verified GitHub profile
+    github_info = await exchange_github_code(data.code)
+
+    if not github_info:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="GitHub sign-in failed. Please try again.",
+        )
+
+    device_info, ip_address = get_client_info(request)
+
+    try:
+        user, is_new_user = await auth_service.github_authenticate(
+            github_info=github_info,
+            terms_version=data.terms_version,
+            privacy_version=data.privacy_version,
+            ip_address=ip_address,
+            user_agent=device_info,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+
+    # Process pending invitations for new users
+    if is_new_user:
+        member_service = MemberService(db)
+        pending_count = await member_service.process_pending_invitations_for_user(user)
+        if pending_count > 0:
+            print(f"[AUTH] Processed {pending_count} pending invitation(s) for {user.email}")
+
+        # Send welcome email with early-adopter badge (skip for superusers/admins)
+        if user.user_number and not getattr(user, 'is_superuser', False):
+            try:
+                sent = await send_welcome_email(
+                    email=user.email,
+                    name=user.name,
+                    user_number=user.user_number,
+                    milestone_badge=user.milestone_badge,
+                )
+                if sent:
+                    from sqlalchemy import update
+                    await db.execute(
+                        update(UserMilestone)
+                        .where(
+                            UserMilestone.user_id == user.id,
+                            UserMilestone.milestone_type == "signup_position",
+                        )
+                        .values(notified=True)
+                    )
+                    await db.flush()
+            except Exception:
+                pass  # Don't fail auth if welcome email fails
+
+    # Generate tokens and create session (same as regular login)
+    return await auth_service.login_user(
+        user=user,
+        remember_me=True,  # OAuth users get extended session by default
         device_info=device_info,
         ip_address=ip_address,
     )

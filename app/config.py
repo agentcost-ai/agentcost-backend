@@ -74,7 +74,11 @@ class Settings(BaseSettings):
     
     # Google OAuth
     google_client_id: str = ""  # Google OAuth Client ID - required for Google Sign-In
-    
+
+    # GitHub OAuth
+    github_client_id: str = ""  # GitHub OAuth App Client ID - required for GitHub Sign-In
+    github_client_secret: str = ""  # GitHub OAuth App Client Secret
+
     # Email - for verification and password reset emails
     resend_api_key: str = ""
     resend_sender_email: str = "noreply@agentcost.tech"

@@ -134,6 +134,7 @@ async def _apply_column_migrations(conn):
                 "last_active_at": {"type": "TIMESTAMP"},
                 "auth_provider":  {"type": "VARCHAR(20)", "default": "'email'", "nullable": False},
                 "google_id":      {"type": "VARCHAR(255)"},
+                "github_id":      {"type": "VARCHAR(255)"},
                 "is_deleted":     {"type": "BOOLEAN", "default": "false", "nullable": False},
                 "deleted_at":     {"type": "TIMESTAMP"},
             },

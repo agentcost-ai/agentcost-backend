@@ -183,6 +183,86 @@ def verify_google_id_token(credential: str) -> Optional[dict]:
         return None
 
 
+async def exchange_github_code(code: str) -> Optional[dict]:
+    """
+    Exchange a GitHub OAuth authorization code for the user's profile.
+
+    Flow: code -> access token (github.com) -> profile + verified primary
+    email (api.github.com, needs the user:email scope).
+
+    Returns:
+        {"id", "email", "name", "avatar_url"} or None if any step fails
+    """
+    import httpx
+
+    settings = get_settings()
+
+    if not settings.github_client_id or not settings.github_client_secret:
+        logger.error("GitHub OAuth: GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET is not configured")
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            token_resp = await client.post(
+                "https://github.com/login/oauth/access_token",
+                headers={"Accept": "application/json"},
+                data={
+                    "client_id": settings.github_client_id,
+                    "client_secret": settings.github_client_secret,
+                    "code": code,
+                },
+            )
+            token_data = token_resp.json()
+            access_token = token_data.get("access_token")
+            if not access_token:
+                logger.warning(
+                    "GitHub OAuth: code exchange failed: %s",
+                    token_data.get("error_description") or token_data.get("error"),
+                )
+                return None
+
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/vnd.github+json",
+            }
+            user_resp = await client.get("https://api.github.com/user", headers=headers)
+            if user_resp.status_code != 200:
+                logger.warning("GitHub OAuth: /user request failed (%s)", user_resp.status_code)
+                return None
+            profile = user_resp.json()
+
+            # The public profile email is usually null; fetch the verified
+            # primary address instead. Unverified emails are never accepted.
+            email = profile.get("email")
+            if not email:
+                emails_resp = await client.get(
+                    "https://api.github.com/user/emails", headers=headers
+                )
+                if emails_resp.status_code == 200:
+                    emails = emails_resp.json()
+                    chosen = next(
+                        (e for e in emails if e.get("primary") and e.get("verified")),
+                        None,
+                    ) or next((e for e in emails if e.get("verified")), None)
+                    if chosen:
+                        email = chosen["email"]
+            if not email:
+                logger.warning(
+                    "GitHub OAuth: no verified email for user %s", profile.get("login")
+                )
+                return None
+
+            return {
+                "id": str(profile["id"]),
+                "email": email,
+                "name": profile.get("name") or profile.get("login"),
+                "avatar_url": profile.get("avatar_url"),
+            }
+    except Exception as e:
+        logger.error("GitHub OAuth: unexpected error during code exchange: %s", e)
+        return None
+
+
 class AuthService:
     """Service class for authentication operations"""
     
@@ -695,6 +775,153 @@ class AuthService:
         
         return user, True
     
+    async def github_authenticate(
+        self,
+        github_info: dict,
+        terms_version: str = "1.0",
+        privacy_version: str = "1.0",
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> Tuple[User, bool]:
+        """
+        Authenticate or register a user via GitHub OAuth.
+
+        Mirrors google_authenticate: match by github_id, then by email
+        (linking GitHub to an existing account), else create a new user.
+
+        Args:
+            github_info: Profile dict from exchange_github_code
+                         ({id, email, name, avatar_url})
+
+        Returns:
+            Tuple of (User, is_new_user)
+
+        Raises:
+            ValueError: If the account is deleted or deactivated
+        """
+        github_id = github_info["id"]
+        email = github_info["email"].lower().strip()
+        name = github_info.get("name")
+        avatar = github_info.get("avatar_url")
+
+        # 1. Try to find by GitHub ID first (returning user via GitHub)
+        result = await self.db.execute(
+            select(User).where(User.github_id == github_id)
+        )
+        user = result.scalar_one_or_none()
+
+        if user:
+            if getattr(user, 'is_deleted', False):
+                if self._is_within_grace_period(user):
+                    await self._reactivate_user(user)
+                    user.grace_period_reactivated = True
+                else:
+                    raise ValueError("This account has been deleted. Please contact support.")
+
+            if not user.is_active:
+                raise ValueError("This account has been deactivated. Please contact support.")
+            if avatar and not user.avatar_url:
+                user.avatar_url = avatar
+            return user, False
+
+        # 2. Check if email already exists (existing user linking to GitHub)
+        user = await self.get_user_by_email(email)
+
+        if user:
+            if getattr(user, 'is_deleted', False):
+                if self._is_within_grace_period(user):
+                    await self._reactivate_user(user)
+                    user.grace_period_reactivated = True
+                else:
+                    raise ValueError("This account has been deleted. Please contact support.")
+
+            if not user.is_active:
+                raise ValueError("This account has been deactivated. Please contact support.")
+
+            # Link GitHub to the existing account
+            user.github_id = github_id
+            if user.password_hash or user.google_id:
+                user.auth_provider = f"{user.auth_provider}+github"
+            else:
+                user.auth_provider = "github"
+
+            # Auto-verify email since GitHub already verified it
+            if not user.email_verified:
+                user.email_verified = True
+                user.email_verification_token = None
+
+            if avatar and not user.avatar_url:
+                user.avatar_url = avatar
+            if name and not user.name:
+                user.name = name
+
+            await self.db.flush()
+            await self.db.refresh(user)
+            return user, False
+
+        # 3. New user — create account
+        user = User(
+            email=email,
+            password_hash=None,  # No password for GitHub-only users
+            name=name,
+            avatar_url=avatar,
+            auth_provider="github",
+            github_id=github_id,
+            email_verified=True,  # GitHub already verified the email
+        )
+
+        try:
+            self.db.add(user)
+            await self.db.flush()
+
+            await self._assign_user_number(user)
+            self._assign_milestone(user)
+
+            terms_consent = PolicyConsent(
+                user_id=user.id,
+                policy_type="terms",
+                policy_version=terms_version,
+                ip_address=ip_address,
+                user_agent=user_agent,
+            )
+            self.db.add(terms_consent)
+
+            privacy_consent = PolicyConsent(
+                user_id=user.id,
+                policy_type="privacy",
+                policy_version=privacy_version,
+                ip_address=ip_address,
+                user_agent=user_agent,
+            )
+            self.db.add(privacy_consent)
+
+            await self.db.flush()
+            await self.db.refresh(user)
+        except IntegrityError:
+            await self.db.rollback()
+            # Race condition: account was created between check and insert.
+            # Retry lookup and link GitHub to the existing account.
+            user = await self.get_user_by_email(email)
+            if user:
+                user.github_id = github_id
+                if user.password_hash or user.google_id:
+                    user.auth_provider = f"{user.auth_provider}+github"
+                else:
+                    user.auth_provider = "github"
+                if not user.email_verified:
+                    user.email_verified = True
+                    user.email_verification_token = None
+                if avatar and not user.avatar_url:
+                    user.avatar_url = avatar
+                if name and not user.name:
+                    user.name = name
+                await self.db.flush()
+                await self.db.refresh(user)
+                return user, False
+            raise ValueError("An account with this email already exists")
+
+        return user, True
+
     async def login_user(
         self,
         user: User,

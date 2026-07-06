@@ -35,8 +35,9 @@ class User(Base):
     password_hash = Column(String(255), nullable=True)  # Nullable for Google OAuth users
     
     # OAuth provider tracking
-    auth_provider = Column(String(20), default="email", nullable=False)  # email, google
+    auth_provider = Column(String(20), default="email", nullable=False)  # email, google, github
     google_id = Column(String(255), unique=True, nullable=True, index=True)  # Google sub claim
+    github_id = Column(String(255), unique=True, nullable=True, index=True)  # GitHub numeric user id
     
     name = Column(String(255), nullable=True)
     avatar_url = Column(String(512), nullable=True)
