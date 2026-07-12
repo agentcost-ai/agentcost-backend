@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from datetime import datetime, timezone
 import asyncio
 
@@ -206,6 +207,13 @@ async def root():
         "docs": "/docs",
         "health": "/v1/health",
     }
+
+
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt():
+    # api.agentcost.tech is crawled by Googlebot (it currently 404s here);
+    # the API surface has no indexable content, so opt the whole host out.
+    return PlainTextResponse("User-agent: *\nDisallow: /\n")
 
 
 if __name__ == "__main__":
