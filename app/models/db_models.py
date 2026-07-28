@@ -151,7 +151,7 @@ class ModelPricing(Base):
     """
     Dynamic model pricing table.
     
-    Stores pricing for 2900+ models synced from LiteLLM.
+    Stores pricing for 3500+ models synced from LiteLLM.
     SDK fetches latest prices from this table via /v1/pricing endpoint.
     """
     
