@@ -62,34 +62,11 @@ async def lifespan(app: FastAPI):
     from .services.cron import cron_loop
     cron_task = asyncio.create_task(cron_loop())
 
-    # Optional: Auto-sync pricing from LiteLLM. Runs in the BACKGROUND so it
-    # never blocks application startup / port binding — the sync fetches and
-    # upserts ~3,500 models, which can exceed the platform's start timeout and
-    # previously hung the deploy at "Waiting for application startup".
-    #
-    # Delegates to sync_pricing_if_due, so a host that sleeps and restarts
-    # repeatedly re-syncs only when the interval has actually elapsed instead
-    # of restarting a full sync on every wake.
-    pricing_task = None
-    if settings.auto_sync_pricing_on_startup:
-        from .services.cron import sync_pricing_if_due
+    # Pricing sync is owned entirely by cron_loop, which already evaluates it on
+    # its first tick at startup. A second task here called the same function at
+    # the same moment, and since a full sync takes minutes, both passed the
+    # is-it-due check and ran overlapping syncs on every boot.
 
-        async def _sync_pricing_background():
-            try:
-                async for db in get_db_session():
-                    await sync_pricing_if_due(db)
-                    break
-            except asyncio.CancelledError:
-                # Not caught by `except Exception` — CancelledError derives from
-                # BaseException. Without this the sync disappeared on shutdown
-                # with nothing in the logs, which reads as "it never ran".
-                logger.info("Pricing sync cancelled by shutdown; will retry when due")
-                raise
-            except Exception as e:
-                logger.warning("Pricing sync failed: %s", e)
-
-        pricing_task = asyncio.create_task(_sync_pricing_background())
-    
     # Auto-seed superuser from environment variables (for Docker / first-time setup)
     admin_email = os.getenv("ADMIN_EMAIL", "").strip()
     admin_password = os.getenv("ADMIN_PASSWORD", "").strip()
@@ -145,15 +122,10 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down AgentCost Backend...")
     cron_task.cancel()
-    if pricing_task:
-        pricing_task.cancel()
-    for task in (cron_task, pricing_task):
-        if task is None:
-            continue
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    try:
+        await cron_task
+    except asyncio.CancelledError:
+        pass
 
     from .utils.rate_limiter import redis_rate_limiter
     if redis_rate_limiter is not None:

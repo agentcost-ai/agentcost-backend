@@ -7,7 +7,6 @@ Handles periodic tasks like purging expired soft-deleted users.
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +22,11 @@ logger = logging.getLogger(__name__)
 # How often the cron loop wakes. Shorter than the pricing interval so a host
 # that sleeps and restarts gets several chances to notice a sync is due.
 _CRON_TICK_SECONDS = 3600
+
+# A "running" claim older than this is assumed to belong to a process that died
+# mid-sync, so a crash cannot block pricing updates indefinitely. Comfortably
+# above a normal full sync, which takes minutes.
+_SYNC_STALE_AFTER_HOURS = 2.0
 
 
 async def purge_expired_soft_deletes(db: AsyncSession) -> int:
@@ -71,26 +75,33 @@ async def purge_expired_soft_deletes(db: AsyncSession) -> int:
     return count
 
 
-async def _hours_since_last_pricing_sync(db: AsyncSession, source: str) -> Optional[float]:
-    """Hours since the last successful sync, or None if there has never been one.
+async def _last_sync(db: AsyncSession, source: str):
+    """Most recent sync that should suppress a new one, with its age in hours.
 
     Read from the database rather than process memory so the schedule survives
     restarts. A host that sleeps between requests restarts constantly; without
     durable state it would either re-sync ~3,500 models on every wake or never
     sync at all.
+
+    In-progress runs count. A full sync takes minutes, so considering only
+    finished ones leaves that entire window open for a second run to start.
     """
-    last = (await db.execute(
-        select(PricingSyncLog.created_at)
-        .where(PricingSyncLog.source == source, PricingSyncLog.status == "ok")
+    row = (await db.execute(
+        select(PricingSyncLog)
+        .where(
+            PricingSyncLog.source == source,
+            PricingSyncLog.status.in_(("ok", "running")),
+        )
         .order_by(PricingSyncLog.created_at.desc())
         .limit(1)
     )).scalar_one_or_none()
 
-    if last is None:
-        return None
-    if last.tzinfo is None:
-        last = last.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - last).total_seconds() / 3600
+    if row is None:
+        return None, None
+    created = row.created_at
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    return row, (datetime.now(timezone.utc) - created).total_seconds() / 3600
 
 
 async def sync_pricing_if_due(db: AsyncSession) -> bool:
@@ -104,33 +115,48 @@ async def sync_pricing_if_due(db: AsyncSession) -> bool:
     if interval <= 0:
         return False
 
-    elapsed = await _hours_since_last_pricing_sync(db, "litellm")
-    if elapsed is not None and elapsed < interval:
-        return False
+    last, elapsed = await _last_sync(db, "litellm")
+    if last is not None:
+        if last.status == "running":
+            # Someone else is mid-sync. Only step in once the run is old enough
+            # that the process running it has certainly died, so a crash cannot
+            # block syncing forever.
+            if elapsed < _SYNC_STALE_AFTER_HOURS:
+                return False
+            logger.warning(
+                "Previous pricing sync has been running %.1fh; treating it as dead",
+                elapsed,
+            )
+        elif elapsed < interval:
+            return False
 
     # Imported here so a pricing-service import error cannot stop the purge job.
     from .pricing_service import PricingService
 
+    # Claim the slot BEFORE the work and commit it, so a concurrent caller sees
+    # the run in progress. sync_from_litellm takes minutes; recording only on
+    # completion left that whole window open and every entry point started its
+    # own overlapping full sync.
+    entry = PricingSyncLog(source="litellm", status="running")
+    db.add(entry)
+    await db.commit()
+
     logger.info(
         "Pricing sync due (last run %s); syncing from LiteLLM",
-        "never" if elapsed is None else f"{elapsed:.1f}h ago",
+        "never" if last is None else f"{elapsed:.1f}h ago",
     )
     pricing_service = PricingService(db)
     started = datetime.now(timezone.utc)
     try:
         result = await pricing_service.sync_from_litellm(track_changes=False)
-        duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         failed = result.get("status") == "error"
 
-        db.add(PricingSyncLog(
-            source="litellm",
-            status="error" if failed else "ok",
-            models_created=result.get("models_created", 0),
-            models_updated=result.get("models_updated", 0),
-            models_skipped=result.get("models_skipped", 0),
-            error_message=result.get("error"),
-            duration_ms=duration_ms,
-        ))
+        entry.status = "error" if failed else "ok"
+        entry.models_created = result.get("models_created", 0)
+        entry.models_updated = result.get("models_updated", 0)
+        entry.models_skipped = result.get("models_skipped", 0)
+        entry.error_message = result.get("error")
+        entry.duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
         await db.commit()
 
         if failed:
@@ -139,11 +165,20 @@ async def sync_pricing_if_due(db: AsyncSession) -> bool:
 
         logger.info(
             "Pricing sync complete: %d created, %d updated (%d ms)",
-            result.get("models_created", 0),
-            result.get("models_updated", 0),
-            duration_ms,
+            entry.models_created, entry.models_updated, entry.duration_ms,
         )
         return True
+    except BaseException as exc:
+        # Includes CancelledError from a shutdown mid-sync. Mark the claim
+        # failed rather than leaving a "running" row to expire on its own.
+        entry.status = "error"
+        entry.error_message = f"{type(exc).__name__}: {exc}"[:500]
+        entry.duration_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+        try:
+            await db.commit()
+        except Exception:
+            await db.rollback()
+        raise
     finally:
         await pricing_service.close()
 

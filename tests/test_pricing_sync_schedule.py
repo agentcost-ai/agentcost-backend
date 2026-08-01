@@ -94,6 +94,63 @@ async def test_a_failed_sync_does_not_count_as_scheduled(test_session: AsyncSess
 
 
 @pytest.mark.asyncio
+async def test_an_in_flight_sync_blocks_a_second_one(test_session: AsyncSession, fake_sync):
+    """The claim is written before the work, not after.
+
+    A full sync takes minutes. Recording it only on completion left that whole
+    window open, so the startup task and the cron loop each began their own
+    overlapping sync on every boot.
+    """
+    test_session.add(PricingSyncLog(
+        source="litellm", status="running",
+        created_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+    ))
+    await test_session.commit()
+
+    assert await cron.sync_pricing_if_due(test_session) is False
+    assert fake_sync["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_claim_eventually_releases(test_session: AsyncSession, fake_sync):
+    """A process killed mid-sync must not block pricing updates forever."""
+    test_session.add(PricingSyncLog(
+        source="litellm", status="running",
+        created_at=datetime.now(timezone.utc)
+        - timedelta(hours=cron._SYNC_STALE_AFTER_HOURS + 1),
+    ))
+    await test_session.commit()
+
+    assert await cron.sync_pricing_if_due(test_session) is True
+    assert fake_sync["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_sync_closes_its_claim(test_session: AsyncSession, monkeypatch):
+    """A raising sync must not leave a 'running' row behind."""
+    class _Boom:
+        def __init__(self, db):
+            pass
+
+        async def sync_from_litellm(self, track_changes=False):
+            raise RuntimeError("upstream exploded")
+
+        async def close(self):
+            pass
+
+    import app.services.pricing_service as pricing_module
+    monkeypatch.setattr(pricing_module, "PricingService", _Boom)
+
+    with pytest.raises(RuntimeError):
+        await cron.sync_pricing_if_due(test_session)
+
+    rows = (await test_session.execute(
+        select(PricingSyncLog).where(PricingSyncLog.source == "litellm")
+    )).scalars().all()
+    assert [r.status for r in rows] == ["error"]
+
+
+@pytest.mark.asyncio
 async def test_zero_interval_disables_background_sync(test_session: AsyncSession, fake_sync, monkeypatch):
     settings = get_settings()
     monkeypatch.setattr(settings, "pricing_sync_interval_hours", 0)
