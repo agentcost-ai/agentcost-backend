@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 
 from ..common import MAX_PRICE_PER_1K
 from ..database import get_db
-from ..models.db_models import ModelPricing
+from ..models.db_models import ModelPricing, PricingSyncLog
 from ..services.admin_service import log_admin_action
 from ..services.pricing_service import PricingService
 from ..services.auth_service import get_current_user
@@ -111,17 +111,29 @@ DEFAULT_PRICING = {
 }
 
 
+async def _last_synced_at(db: AsyncSession) -> Optional[datetime]:
+    """When the catalogue was last refreshed from a pricing source.
+
+    Deliberately not max(ModelPricing.updated_at): that moves only when a price
+    actually changes, so a quiet week upstream would report the catalogue as a
+    week stale when it had in fact just been checked. Callers asking "is this
+    current?" mean the sync, not the last price movement.
+    """
+    return (await db.execute(
+        select(func.max(PricingSyncLog.created_at))
+        .where(PricingSyncLog.status == "ok")
+    )).scalar()
+
+
 @router.get("/sync/status")
 async def get_sync_status(db: AsyncSession = Depends(get_db)):
     """Get pricing sync status."""
     total_query = select(func.count(ModelPricing.id)).where(ModelPricing.is_active == True)
     total_result = await db.execute(total_query)
     total_models = total_result.scalar() or 0
-    
-    last_update_query = select(func.max(ModelPricing.updated_at))
-    last_update_result = await db.execute(last_update_query)
-    last_updated = last_update_result.scalar()
-    
+
+    last_updated = await _last_synced_at(db)
+
     provider_query = select(
         ModelPricing.provider, 
         func.count(ModelPricing.id)
@@ -185,13 +197,16 @@ async def get_all_pricing(
                 'provider': model.provider,
                 'updated_at': model.updated_at.isoformat() if model.updated_at else None,
             }
+        # last_updated = when the catalogue was last refreshed; per-model
+        # updated_at above still reports when that model's price last moved.
+        synced_at = await _last_synced_at(db) or max(
+            (m.updated_at for m in db_pricing if m.updated_at),
+            default=datetime.now(timezone.utc),
+        )
         return {
             "pricing": pricing,
             "source": "database",
-            "last_updated": max(
-                (m.updated_at for m in db_pricing if m.updated_at),
-                default=datetime.now(timezone.utc)
-            ).isoformat(),
+            "last_updated": synced_at.isoformat(),
         }
     
     pricing = DEFAULT_PRICING
