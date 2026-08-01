@@ -1,10 +1,17 @@
-"""Shared helpers (UUID generation, password rules).
+"""Shared helpers (UUID generation, password rules, pricing bounds).
 
 Lives at app/ level to avoid circular imports between utils/ and models/.
 """
 
 import re
 import uuid
+
+# Sanity ceiling for a hand-entered rate. The dearest real model today is well
+# under $1 per 1k tokens, so anything above this is a unit mistake (per-million
+# rates pasted into a per-1k field) rather than a real price. These values are
+# re-applied to every ingested event's stored cost, so a bad one is not an
+# estimate, it is permanently baked into customers' history.
+MAX_PRICE_PER_1K = 10.0
 
 
 def generate_uuid() -> str:

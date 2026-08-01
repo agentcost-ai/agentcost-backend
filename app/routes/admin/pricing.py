@@ -20,12 +20,7 @@ from ._deps import require_superuser
 
 router = APIRouter()
 
-# Sanity ceiling for a hand-entered rate. The dearest real model today is well
-# under $1 per 1k tokens, so anything above this is a unit mistake (per-million
-# rates pasted into a per-1k field) rather than a real price. These values are
-# re-applied to every ingested event's stored cost, so a bad one is not an
-# estimate — it is permanently baked into customers' history.
-MAX_PRICE_PER_1K = 10.0
+from ...common import MAX_PRICE_PER_1K
 
 
 class ModelPricingUpdate(BaseModel):

@@ -609,7 +609,6 @@ class AuthService:
             return None
         
         # Soft-deleted users: check grace period
-        reactivated = False
         if getattr(user, 'is_deleted', False):
             if self._is_within_grace_period(user):
                 await self._reactivate_user(user)

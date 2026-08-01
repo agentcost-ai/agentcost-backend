@@ -64,6 +64,5 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-tests/
 scripts/
 uploads/

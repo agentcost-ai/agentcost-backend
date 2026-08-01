@@ -760,7 +760,7 @@ class OptimizationService:
                     f"Latency increased {deviation_pct:.0f}% for {context} - "
                     f"check provider status page for incidents"
                 )
-                actions.append(f"Review recent prompt changes that may have increased token count")
+                actions.append("Review recent prompt changes that may have increased token count")
             else:
                 actions.append(f"Latency improved for {context} - no action needed")
         elif metric_type == "p95":

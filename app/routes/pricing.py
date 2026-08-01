@@ -5,15 +5,18 @@ To sync pricing, call POST /v1/pricing/sync/litellm which fetches from:
 https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json
 """
 
-from fastapi import APIRouter, Depends, Query, HTTPException, status
+from fastapi import APIRouter, Depends, Query, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
+from ..common import MAX_PRICE_PER_1K
 from ..database import get_db
 from ..models.db_models import ModelPricing
+from ..services.admin_service import log_admin_action
 from ..services.pricing_service import PricingService
 from ..services.auth_service import get_current_user
 from ..models.user_models import User
@@ -249,41 +252,86 @@ async def get_model_pricing(model_name: str, db: AsyncSession = Depends(get_db))
     }
 
 
+class PricingEntry(BaseModel):
+    """One model's rates, in USD per 1,000 tokens."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input: Optional[float] = Field(None, ge=0, le=MAX_PRICE_PER_1K)
+    output: Optional[float] = Field(None, ge=0, le=MAX_PRICE_PER_1K)
+    provider: Optional[str] = Field(None, max_length=100)
+
+
 @router.post("")
 async def update_pricing(
-    pricing_updates: Dict[str, Dict[str, float]],
+    pricing_updates: Dict[str, PricingEntry],
+    request: Request,
     db: AsyncSession = Depends(get_db),
-    _admin: User = Depends(get_admin_user),
+    admin: User = Depends(get_admin_user),
 ):
-    """Update pricing for models (Admin)."""
+    """Update pricing for models (Admin).
+
+    Bounded and audited like the admin dashboard's per-model override: these
+    rates are re-applied to every ingested event, so an unchecked value is
+    written permanently into customers' cost history.
+    """
+    if not pricing_updates:
+        raise HTTPException(status_code=422, detail="No pricing entries supplied.")
+
     updated_count = 0
-    
+    created_count = 0
+    audited: Dict[str, Any] = {}
+
     for model_name, prices in pricing_updates.items():
-        query = select(ModelPricing).where(ModelPricing.model_name == model_name)
-        result = await db.execute(query)
-        existing = result.scalar_one_or_none()
-        
+        existing = (await db.execute(
+            select(ModelPricing).where(ModelPricing.model_name == model_name)
+        )).scalar_one_or_none()
+
+        # exclude_unset so an omitted rate keeps its stored value instead of
+        # being reset to the field default.
+        supplied = prices.model_dump(exclude_unset=True)
+
         if existing:
-            existing.input_price_per_1k = prices.get('input', existing.input_price_per_1k)
-            existing.output_price_per_1k = prices.get('output', existing.output_price_per_1k)
-            existing.provider = prices.get('provider', existing.provider)
-            existing.updated_at = datetime.now(timezone.utc)
+            before = {}
+            for field, column in (("input", "input_price_per_1k"),
+                                  ("output", "output_price_per_1k"),
+                                  ("provider", "provider")):
+                if field not in supplied:
+                    continue
+                current = getattr(existing, column)
+                if current != supplied[field]:
+                    before[column] = current
+                    setattr(existing, column, supplied[field])
+            if before:
+                existing.updated_at = datetime.now(timezone.utc)
+                audited[model_name] = {"before": before}
+                updated_count += 1
         else:
-            new_pricing = ModelPricing(
+            db.add(ModelPricing(
                 model_name=model_name,
-                input_price_per_1k=prices.get('input', 0.0),
-                output_price_per_1k=prices.get('output', 0.0),
-                provider=prices.get('provider', 'unknown'),
-            )
-            db.add(new_pricing)
-        
-        updated_count += 1
-    
+                input_price_per_1k=supplied.get("input", 0.0),
+                output_price_per_1k=supplied.get("output", 0.0),
+                provider=supplied.get("provider", "unknown"),
+            ))
+            audited[model_name] = {"created": supplied}
+            created_count += 1
+
+    if audited:
+        await log_admin_action(
+            db,
+            admin_id=admin.id,
+            action_type="model_pricing_bulk_updated",
+            target_type="model_pricing",
+            details={"models": audited},
+            ip_address=request.client.host if request.client else None,
+        )
+
     await db.commit()
-    
+
     return {
         "status": "ok",
         "models_updated": updated_count,
+        "models_created": created_count,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

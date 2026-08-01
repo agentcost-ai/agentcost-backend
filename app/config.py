@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     app_version: str = get_version()  
     debug: bool = False
     environment: str = "development"  # development, staging, production
+    log_level: str = "INFO"
     
     # Database
     # Default: SQLite for development

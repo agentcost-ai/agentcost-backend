@@ -661,7 +661,6 @@ class PricingService:
                     if not alt_pricing:
                         continue
                     
-                    alt_total = alt_pricing["input"] + alt_pricing["output"]
                     input_savings = source_pricing["input"] - alt_pricing["input"]
                     output_savings = source_pricing["output"] - alt_pricing["output"]
                     total_savings = input_savings + output_savings

@@ -420,7 +420,6 @@ class BaselineService:
                 daily_rate_recent = (call_count / hours_in_period) * 24
                 call_z = (daily_rate_recent - baseline.avg_daily_calls) / baseline.stddev_daily_calls
                 if abs(call_z) > self.ANOMALY_THRESHOLD_MEDIUM:
-                    direction = "higher" if call_z > 0 else "lower"
                     anomalies.append(AnomalyResult(
                         metric_name=f"call_volume_{row.agent_name}_{row.model}",
                         current_value=daily_rate_recent,

@@ -2,6 +2,11 @@
 AgentCost Backend - Models
 
 Database models and Pydantic schemas.
+
+Do not prune the db_models imports below to match __all__. Importing every
+model here is what registers it on Base.metadata, which create_all relies on;
+a linter will call several of them unused, but dropping them silently stops
+their tables from being created.
 """
 
 from .db_models import (

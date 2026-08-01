@@ -17,7 +17,7 @@ from ..models.auth_schemas import (
     RefreshTokenRequest, PolicyCheckResponse, PolicyConsentInput,
     GoogleAuthRequest, GitHubAuthRequest
 )
-from ..services.auth_service import AuthService, decode_token, verify_google_id_token, exchange_github_code
+from ..services.auth_service import AuthService, verify_google_id_token, exchange_github_code
 from ..services.email_service import send_verification_email, send_password_reset_email, send_welcome_email
 from ..services.member_service import MemberService
 from ..models.user_models import User
@@ -734,16 +734,7 @@ async def list_sessions(
     Requires authentication.
     """
     sessions = await auth_service.get_active_sessions(user.id)
-    
-    # Determine current session
-    current_token_hash = None
-    if credentials:
-        payload = decode_token(credentials.credentials)
-        if payload:
-            # We can't easily identify the current session from access token
-            # This would need the refresh token instead
-            pass
-    
+
     session_list = [
         SessionInfo(
             id=s.id,
