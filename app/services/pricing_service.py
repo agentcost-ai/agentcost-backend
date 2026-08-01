@@ -303,8 +303,16 @@ class PricingService:
         updated_count = 0
         created_count = 0
         skipped_count = 0
+        unchanged_count = 0
         changes = {"new_models": [], "price_changes": [], "capability_changes": []}
-        
+
+        # Load the catalogue once. The per-model SELECT this replaces issued one
+        # round trip per entry (~3,500), which is what made a sync take minutes.
+        existing_by_name = {
+            row.model_name: row
+            for row in (await self.db.execute(select(ModelPricing))).scalars()
+        }
+
         for model_key, model_data in pricing_data.items():
             if not isinstance(model_data, dict):
                 skipped_count += 1
@@ -337,10 +345,8 @@ class PricingService:
             supports_function_calling = model_data.get("supports_function_calling", False)
             supports_streaming = model_data.get("supports_streaming", True)
             
-            query = select(ModelPricing).where(ModelPricing.model_name == model_name)
-            result = await self.db.execute(query)
-            existing = result.scalar_one_or_none()
-            
+            existing = existing_by_name.get(model_name)
+
             if existing:
                 if track_changes:
                     old_input = existing.input_price_per_1k
@@ -377,17 +383,32 @@ class PricingService:
                             "old": existing.supports_streaming, "new": supports_streaming,
                         })
                 
-                existing.input_price_per_1k = input_price_per_1k
-                existing.output_price_per_1k = output_price_per_1k
-                existing.provider = provider
-                existing.max_tokens = max_tokens
-                existing.supports_vision = supports_vision
-                existing.supports_function_calling = supports_function_calling
-                existing.supports_streaming = supports_streaming
-                existing.pricing_source = "litellm"
-                existing.source_updated_at = datetime.now(timezone.utc)
-                existing.updated_at = datetime.now(timezone.utc)
-                updated_count += 1
+                # Assign only what actually differs. Writing every field on every
+                # run dirtied all ~3,500 rows each sync, so the UPDATE count
+                # reported real churn as if it were price movement and the write
+                # cost was paid whether or not anything had changed upstream.
+                row_changed = False
+                for field, value in (
+                    ("input_price_per_1k", input_price_per_1k),
+                    ("output_price_per_1k", output_price_per_1k),
+                    ("provider", provider),
+                    ("max_tokens", max_tokens),
+                    ("supports_vision", supports_vision),
+                    ("supports_function_calling", supports_function_calling),
+                    ("supports_streaming", supports_streaming),
+                    ("pricing_source", "litellm"),
+                ):
+                    if getattr(existing, field) != value:
+                        setattr(existing, field, value)
+                        row_changed = True
+
+                if row_changed:
+                    now = datetime.now(timezone.utc)
+                    existing.source_updated_at = now
+                    existing.updated_at = now
+                    updated_count += 1
+                else:
+                    unchanged_count += 1
             else:
                 if track_changes:
                     changes["new_models"].append({
@@ -413,15 +434,20 @@ class PricingService:
                     source_updated_at=datetime.now(timezone.utc),
                 )
                 self.db.add(new_pricing)
+                # Register it: LiteLLM can canonicalize two keys onto one
+                # model_name, and model_name is UNIQUE. Without this the second
+                # occurrence would insert a duplicate and fail the constraint.
+                existing_by_name[model_name] = new_pricing
                 created_count += 1
-        
+
         await self.db.flush()
-        
+
         result = {
             "status": "ok",
             "source": "litellm",
             "models_created": created_count,
             "models_updated": updated_count,
+            "models_unchanged": unchanged_count,
             "models_skipped": skipped_count,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
