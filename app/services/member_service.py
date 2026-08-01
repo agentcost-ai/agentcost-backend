@@ -7,7 +7,7 @@ Handles project membership operations: invitations, role changes, removals.
 from datetime import datetime, timezone
 from typing import Optional, List, Tuple, Union
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, delete
+from sqlalchemy import select, and_
 from sqlalchemy.exc import IntegrityError
 
 from ..models.user_models import User, ProjectMember, UserRole, PendingEmailInvitation

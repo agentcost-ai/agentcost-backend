@@ -10,15 +10,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from datetime import datetime
-import uuid
 
 from ..database import Base
 from ..common import generate_uuid
-
-
-def generate_api_key():
-    return f"sk_{uuid.uuid4().hex}"
 
 
 class Project(Base):
@@ -29,7 +23,10 @@ class Project(Base):
     id = Column(String(36), primary_key=True, default=generate_uuid)
     name = Column(String(255), nullable=False)
     description = Column(Text, nullable=True)
-    api_key = Column(String(255), unique=True, nullable=False, default=generate_api_key)
+    # Stores the SHA-256 hash of the key, never the key itself. No column
+    # default: callers must supply the hash, so a missing one fails loudly
+    # instead of persisting a project that can never authenticate.
+    api_key = Column(String(255), unique=True, nullable=False)
     
     owner_id = Column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     is_active = Column(Boolean, default=True)

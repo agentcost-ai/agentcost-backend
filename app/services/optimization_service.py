@@ -1,10 +1,10 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, case
+from sqlalchemy import select, func, case, and_, or_
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
 
-from ..models.db_models import Event, ModelPricing
+from ..models.db_models import Event, ProjectBaseline
 from .analytics_service import AnalyticsService
 from .pricing_service import PricingService
 from .baseline_service import (
@@ -24,18 +24,61 @@ class OptimizationType(str, Enum):
 
 
 class OptimizationService:
-    
+
     # Minimum savings to show a suggestion (matches recommendation threshold)
     # Suggestions below this won't have Implement/Dismiss buttons anyway
     MIN_ACTIONABLE_SAVINGS = 1.0
-    
+
+    # Most recent events per (agent, model) inspected for capability hints.
+    CAPABILITY_SAMPLE_ROWS = 200
+
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.pricing_service = PricingService(db)
+        # One suggestions request fans out over every (model, agent) group and
+        # re-resolves the same ModelPricing rows for each -- source model plus
+        # every alternative. The memo collapses that to one query per distinct
+        # model name and lives exactly as long as this service does.
+        self.pricing_service = PricingService(db, memoize_lookups=True)
         self.baseline_service = BaselineService(db)
         self.pattern_service = PatternAnalysisService(db)
         self.tracking_service = RecommendationTrackingService(db)
-    
+
+        self._alternatives_cache: Dict[Tuple[Any, ...], List[Dict[str, Any]]] = {}
+
+        # Baselines for the project, loaded once instead of per result row.
+        self._baseline_cache: Optional[Dict[Tuple[Any, Any], ProjectBaseline]] = None
+        self._baseline_cache_project: Optional[str] = None
+
+    async def _discover_alternatives_cached(self, **kwargs) -> List[Dict[str, Any]]:
+        """Memoized discover_alternatives: identical groups ask identical questions."""
+        key = tuple(sorted(kwargs.items()))
+        if key not in self._alternatives_cache:
+            self._alternatives_cache[key] = await self.pricing_service.discover_alternatives(
+                **kwargs
+            )
+        return self._alternatives_cache[key]
+
+    async def _get_baselines(self, project_id: str) -> Dict[Tuple[Any, Any], ProjectBaseline]:
+        """All baselines for a project keyed by (agent_name, model), loaded once.
+
+        A project has at most a few hundred baseline rows, so one read beats a
+        query per (agent, model) group in the analyzers' row loops.
+        """
+        if self._baseline_cache is None or self._baseline_cache_project != project_id:
+            query = (
+                select(ProjectBaseline)
+                .where(ProjectBaseline.project_id == project_id)
+                .order_by(ProjectBaseline.last_calculated_at.desc())
+            )
+            result = await self.db.execute(query)
+            cache: Dict[Tuple[Any, Any], ProjectBaseline] = {}
+            for baseline in result.scalars().all():
+                # First row wins: same "freshest baseline" rule get_baseline uses.
+                cache.setdefault((baseline.agent_name, baseline.model), baseline)
+            self._baseline_cache = cache
+            self._baseline_cache_project = project_id
+        return self._baseline_cache
+
     async def _generate_suggestions(
         self,
         project_id: str,
@@ -137,28 +180,36 @@ class OptimizationService:
         ).group_by(Event.model, Event.agent_name)
         
         result = await self.db.execute(query)
-        
+
+        # Materialize and filter first: capability inference is then resolved for
+        # every surviving group in a single query instead of two queries per
+        # group (a 20-group project used to spend ~40 round trips here alone).
+        groups = []
         for row in result:
+            cost = float(row.total_cost) if row.total_cost is not None else 0.0
+            calls = int(row.call_count) if row.call_count is not None else 0
+            if calls < 10 or cost < 0.01:
+                continue
+            groups.append((row, calls, cost))
+
+        capability_states = await self._infer_capability_requirements_bulk(
+            project_id=project_id,
+            pairs={(row.agent_name, row.model): calls for row, calls, _ in groups},
+            start_time=start_time,
+            end_time=end_time,
+        )
+        await self.pricing_service.prefetch_pricing(row.model for row, _, _ in groups)
+
+        for row, calls, cost in groups:
             model = row.model
             agent = row.agent_name
             # Convert Decimal values to float for arithmetic operations
-            cost = float(row.total_cost) if row.total_cost is not None else 0.0
             avg_output = float(row.avg_output_tokens) if row.avg_output_tokens is not None else 0.0
             avg_input = float(row.avg_input_tokens) if row.avg_input_tokens is not None else 0.0
-            calls = int(row.call_count) if row.call_count is not None else 0
             total_input = int(row.total_input_tokens) if row.total_input_tokens is not None else 0
             total_output = int(row.total_output_tokens) if row.total_output_tokens is not None else 0
-            
-            if calls < 10 or cost < 0.01:
-                continue
 
-            capability_state = await self._infer_capability_requirements(
-                project_id=project_id,
-                agent_name=agent,
-                model=model,
-                start_time=start_time,
-                end_time=end_time,
-            )
+            capability_state = capability_states[(agent, model)]
 
             requires_vision = capability_state.get("requires_vision") == "true"
             requires_function_calling = (
@@ -172,7 +223,7 @@ class OptimizationService:
             if requires_json_mode:
                 continue
             
-            alternatives = await self.pricing_service.discover_alternatives(
+            alternatives = await self._discover_alternatives_cached(
                 model=model,
                 avg_output_tokens=int(avg_output),
                 avg_input_tokens=int(avg_input),
@@ -414,7 +465,8 @@ class OptimizationService:
         )
         
         result = await self.db.execute(query)
-        
+        baselines = await self._get_baselines(project_id)
+
         for row in result:
             agent = row.agent_name
             model = row.model
@@ -422,19 +474,15 @@ class OptimizationService:
             total_calls = int(row.total_calls) if row.total_calls is not None else 0
             errors = int(row.error_count) if row.error_count is not None else 0
             wasted = float(row.wasted_cost) if row.wasted_cost is not None else 0.0
-            
+
             if total_calls < 10 or errors < 3:
                 continue
-            
+
             error_rate = errors / total_calls
-            
-            # Get baseline error rate
-            baseline = await self.baseline_service.get_baseline(
-                project_id=project_id,
-                agent_name=agent,
-                model=model,
-            )
-            
+
+            # Get baseline error rate (prefetched, see _get_baselines)
+            baseline = baselines.get((agent, model))
+
             baseline_error_rate = baseline.avg_error_rate if baseline else 0.02
             
             # Only flag if significantly above baseline
@@ -510,7 +558,8 @@ class OptimizationService:
         )
         
         result = await self.db.execute(query)
-        
+        baselines = await self._get_baselines(project_id)
+
         for row in result:
             agent = row.agent_name
             model = row.model
@@ -518,17 +567,13 @@ class OptimizationService:
             avg_latency = float(row.avg_latency) if row.avg_latency is not None else 0.0
             avg_input = float(row.avg_input_tokens) if row.avg_input_tokens is not None else 0.0
             calls = int(row.call_count) if row.call_count is not None else 0
-            
+
             if calls < 10:
                 continue
-            
-            # Get baseline
-            baseline = await self.baseline_service.get_baseline(
-                project_id=project_id,
-                agent_name=agent,
-                model=model,
-            )
-            
+
+            # Get baseline (prefetched, see _get_baselines)
+            baseline = baselines.get((agent, model))
+
             if not baseline or baseline.stddev_latency_ms == 0:
                 continue
             
@@ -837,68 +882,95 @@ class OptimizationService:
         else:
             return "low"
 
-    async def _infer_capability_requirements(
+    UNKNOWN_CAPABILITIES = {
+        "requires_vision": "unknown",
+        "requires_function_calling": "unknown",
+        "requires_json_mode": "unknown",
+    }
+
+    async def _infer_capability_requirements_bulk(
         self,
         project_id: str,
-        agent_name: str,
-        model: str,
+        pairs: Dict[Tuple[str, str], int],
         start_time: datetime,
         end_time: datetime,
-    ) -> Dict[str, str]:
+    ) -> Dict[Tuple[str, str], Dict[str, str]]:
         """
-        Infer capability requirements from historical event metadata.
+        Infer capability requirements for many (agent, model) pairs at once.
 
-        Returns string states: "true", "false", or "unknown".
+        ``pairs`` maps (agent_name, model) to the group's call count, which the
+        caller already aggregated -- re-counting it per pair was one of the two
+        queries this used to issue for every group. The metadata sample is taken
+        for all pairs in one pass with a window function, keeping the same
+        per-pair cap as before.
         """
-        total_query = select(func.count(Event.id)).where(
-            Event.project_id == project_id,
-            Event.agent_name == agent_name,
-            Event.model == model,
-            Event.timestamp >= start_time,
-            Event.timestamp <= end_time,
+        states = {pair: dict(self.UNKNOWN_CAPABILITIES) for pair in pairs}
+        if not pairs:
+            return states
+
+        pair_filter = or_(
+            *[
+                and_(Event.agent_name == agent, Event.model == model)
+                for agent, model in pairs
+            ]
         )
-        total_result = await self.db.execute(total_query)
-        total_calls = int(total_result.scalar() or 0)
 
-        meta_query = select(Event.extra_data).where(
+        ranked = select(
+            Event.agent_name.label("agent_name"),
+            Event.model.label("model"),
+            Event.extra_data.label("extra_data"),
+            func.row_number()
+            .over(
+                partition_by=(Event.agent_name, Event.model),
+                order_by=Event.timestamp.desc(),
+            )
+            .label("rn"),
+        ).where(
             Event.project_id == project_id,
-            Event.agent_name == agent_name,
-            Event.model == model,
             Event.timestamp >= start_time,
             Event.timestamp <= end_time,
             Event.extra_data.isnot(None),
-        ).order_by(Event.timestamp.desc()).limit(200)
+            pair_filter,
+        ).subquery()
 
-        meta_result = await self.db.execute(meta_query)
-        metadata_rows = [row[0] for row in meta_result.all() if row and row[0]]
+        meta_query = select(
+            ranked.c.agent_name, ranked.c.model, ranked.c.extra_data
+        ).where(ranked.c.rn <= self.CAPABILITY_SAMPLE_ROWS)
 
-        if total_calls < 10 or len(metadata_rows) == 0:
-            return {
-                "requires_vision": "unknown",
-                "requires_function_calling": "unknown",
-                "requires_json_mode": "unknown",
-            }
+        metadata_by_pair: Dict[Tuple[str, str], List[Any]] = {}
+        for row in await self.db.execute(meta_query):
+            if row.extra_data:
+                metadata_by_pair.setdefault((row.agent_name, row.model), []).append(
+                    row.extra_data
+                )
 
-        requires_vision = False
-        requires_function_calling = False
-        requires_json_mode = False
-
-        for meta in metadata_rows:
-            if not isinstance(meta, dict):
+        for pair, total_calls in pairs.items():
+            metadata_rows = metadata_by_pair.get(pair, [])
+            if total_calls < 10 or not metadata_rows:
                 continue
 
-            if self._detect_vision(meta):
-                requires_vision = True
-            if self._detect_function_calling(meta):
-                requires_function_calling = True
-            if self._detect_json_mode(meta):
-                requires_json_mode = True
+            requires_vision = False
+            requires_function_calling = False
+            requires_json_mode = False
 
-        return {
-            "requires_vision": "true" if requires_vision else "false",
-            "requires_function_calling": "true" if requires_function_calling else "false",
-            "requires_json_mode": "true" if requires_json_mode else "false",
-        }
+            for meta in metadata_rows:
+                if not isinstance(meta, dict):
+                    continue
+
+                if self._detect_vision(meta):
+                    requires_vision = True
+                if self._detect_function_calling(meta):
+                    requires_function_calling = True
+                if self._detect_json_mode(meta):
+                    requires_json_mode = True
+
+            states[pair] = {
+                "requires_vision": "true" if requires_vision else "false",
+                "requires_function_calling": "true" if requires_function_calling else "false",
+                "requires_json_mode": "true" if requires_json_mode else "false",
+            }
+
+        return states
 
     def _detect_vision(self, meta: Dict[str, Any]) -> bool:
         vision_keys = {"vision", "image", "images", "image_url", "input_image", "input_images"}

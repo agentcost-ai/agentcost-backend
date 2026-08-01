@@ -5,15 +5,14 @@ Endpoints for managing project team members: invitations, roles, removals.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from datetime import datetime
 
 from ..database import get_db
-from ..models.user_models import User, UserRole
-from ..services.auth_service import get_current_user
+from ..models.user_models import User
 from ..services.member_service import MemberService
 from ..services.permission_service import PermissionService, Permission
 from ..services.email_service import send_invitation_email, send_new_user_invitation_email

@@ -4,6 +4,7 @@ AgentCost Backend - Authentication Service
 Handles password hashing, JWT generation/validation, and session management.
 """
 
+import asyncio
 import os
 import secrets
 import hashlib
@@ -13,15 +14,14 @@ from typing import Optional, Tuple
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, delete, func as sa_func
+from sqlalchemy import select, update, func as sa_func
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import selectinload
 
-from ..models.user_models import User, UserSession, ProjectMember, PolicyConsent
+from ..models.user_models import User, UserSession, PolicyConsent
 from ..models.db_models import UserMilestone
 from ..models.auth_schemas import (
-    UserRegister, UserLogin, UserResponse, TokenResponse,
-    SessionInfo, ProfileUpdate, PolicyConsentStatus, PolicyCheckResponse
+    UserRegister, UserResponse, TokenResponse, ProfileUpdate,
+    PolicyConsentStatus, PolicyCheckResponse
 )
 from ..config import get_settings
 
@@ -39,6 +39,20 @@ def hash_password(password: str) -> str:
 def verify_password(plain_password: str, hashed_password: str) -> bool:
     """Verify a password against its hash"""
     return pwd_context.verify(plain_password, hashed_password)
+
+
+# bcrypt is deliberately slow (~235 ms per call here) and the app runs a single
+# uvicorn worker, so calling it inline stalls the event loop for every other
+# request. Async callers must use these; the sync versions remain for startup
+# and tests, which have no loop to block.
+async def hash_password_async(password: str) -> str:
+    """Hash a password without blocking the event loop."""
+    return await asyncio.to_thread(pwd_context.hash, password)
+
+
+async def verify_password_async(plain_password: str, hashed_password: str) -> bool:
+    """Verify a password without blocking the event loop."""
+    return await asyncio.to_thread(pwd_context.verify, plain_password, hashed_password)
 
 
 settings = get_settings()
@@ -397,7 +411,7 @@ class AuthService:
                 existing.auth_provider == "google"
                 and not existing.password_hash
             ):
-                existing.password_hash = hash_password(data.password)
+                existing.password_hash = await hash_password_async(data.password)
                 existing.auth_provider = "google+email"
                 if data.name and not existing.name:
                     existing.name = data.name
@@ -409,9 +423,10 @@ class AuthService:
         # Generate verification token - keep plaintext for email, store hash in DB
         _plaintext_verification_token = generate_verification_token()
         
+        password_hash = await hash_password_async(data.password)
         user = User(
             email=normalized_email,
-            password_hash=hash_password(data.password),
+            password_hash=password_hash,
             name=data.name,
             email_verification_token=hash_token(_plaintext_verification_token),
         )
@@ -607,7 +622,7 @@ class AuthService:
         if not user.password_hash:
             return None
         
-        if not verify_password(password, user.password_hash):
+        if not await verify_password_async(password, user.password_hash):
             return None
         
         if not user.is_active:
@@ -1087,7 +1102,7 @@ class AuthService:
         if not user:
             return False
         
-        user.password_hash = hash_password(new_password)
+        user.password_hash = await hash_password_async(new_password)
         user.password_reset_token = None
         user.password_reset_expires = None
         
@@ -1116,11 +1131,11 @@ class AuthService:
         if not user.password_hash:
             return False
         
-        if not verify_password(current_password, user.password_hash):
+        if not await verify_password_async(current_password, user.password_hash):
             return False
-        
-        user.password_hash = hash_password(new_password)
-        
+
+        user.password_hash = await hash_password_async(new_password)
+
         await self.db.flush()
         return True
     

@@ -4,43 +4,55 @@ AgentCost Backend - Event Ingestion Service
 Business logic for storing and processing events.
 """
 
+from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ..models.db_models import Event, Project
 from ..models.schemas import EventCreate
 
+# Prices are quoted per 1000 tokens, so a single call's cost runs to small
+# fractions of a cent. Round at the precision PricingService prices with.
+_COST_PRECISION = 8
+
+
+@dataclass
+class PreparedBatch:
+    """Priced, not-yet-persisted events plus the aggregates they imply.
+
+    Splitting "price it" from "write it" is what lets budget enforcement run
+    against the cost the server is actually going to store instead of the
+    figure the client claimed.
+    """
+
+    project_id: str
+    rows: List[Event] = field(default_factory=list)
+    # (agent_name, input_hash) -> (occurrences, summed cost)
+    pattern_counts: Dict[Tuple[str, str], Tuple[int, float]] = field(default_factory=dict)
+    total_cost: float = 0.0
+
 
 class EventService:
     """Service for event ingestion and queries"""
-    
+
     def __init__(self, db: AsyncSession):
         self.db = db
-    
-    async def create_events_batch(
-        self, 
-        project_id: str, 
-        events: List[EventCreate]
-    ) -> int:
+
+    async def prepare_events_batch(
+        self,
+        project_id: str,
+        events: List[EventCreate],
+    ) -> PreparedBatch:
+        """Build (but do not write) the Event rows for a batch.
+
+        Nothing is added to the session here.
         """
-        Create multiple events in a single transaction.
-        
-        Args:
-            project_id: Project ID
-            events: List of event data
-            
-        Returns:
-            Number of events created
-        """
-        from .baseline_service import PatternAnalysisService
-        
-        db_events = []
-        pattern_service = PatternAnalysisService(self.db)
+        db_events: List[Event] = []
         from .pricing_service import PricingService
         pricing_service = PricingService(self.db)
-        
+
         # pre-fetch pricing for all unique models in the batch
         # to eliminate N+1 per-event DB queries.
         try:
@@ -49,15 +61,29 @@ class EventService:
             for model_name in unique_models:
                 pricing_cache[model_name] = await pricing_service.get_model_pricing(model_name)
 
-            # Collect pattern records to batch after the loop
-            pattern_records: list[tuple[str, str, str, float]] = []
+            # (agent_name, input_hash) -> (occurrences, summed cost), folded
+            # here so the whole batch costs one read + one write pass later.
+            pattern_counts: dict[tuple[str, str], tuple[int, float]] = {}
+            total_cost = 0.0
+
+            ingested_at = datetime.now(timezone.utc)
 
             for event_data in events:
-                # Parse timestamp
+                # Pin the zone, then clamp: analytics bounds on
+                # `timestamp <= now(UTC)`, so a naive or future-dated row would
+                # be stored but invisible in every chart and KPI.
                 timestamp = datetime.fromisoformat(
                     event_data.timestamp.replace('Z', '+00:00')
                 )
-                
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                else:
+                    timestamp = timestamp.astimezone(timezone.utc)
+                if timestamp > ingested_at:
+                    timestamp = ingested_at
+
+                # Always derived, never trusted: the client's total_tokens is
+                # optional and has been seen to disagree with its own counts.
                 total_tokens = event_data.input_tokens + event_data.output_tokens
 
                 # Use cached pricing instead of per-event DB query
@@ -65,17 +91,26 @@ class EventService:
                 if pricing is not None:
                     input_cost = (event_data.input_tokens / 1000) * pricing["input"]
                     output_cost = (event_data.output_tokens / 1000) * pricing["output"]
-                    calculated_cost = round(input_cost + output_cost, 8)
+                    calculated_cost = round(input_cost + output_cost, _COST_PRECISION)
                 else:
                     calculated_cost = 0.0
 
-                # Use server cost when available; fall back to SDK-provided cost
+                # Use server cost when available; fall back to SDK-provided cost.
+                # cost_source records *how* we priced it, so a fuzzy match
+                # (a neighbouring model's rates) is distinguishable from an
+                # exact one downstream.
                 if calculated_cost > 0:
                     final_cost = calculated_cost
-                    cost_source = pricing.get("source", "database")
+                    cost_source = (
+                        "database-fuzzy"
+                        if pricing.get("match") == "fuzzy"
+                        else "database-exact"
+                    )
                 else:
-                    final_cost = event_data.cost
+                    final_cost = float(event_data.cost or 0.0)
                     cost_source = "client-sdk"
+
+                total_cost += final_cost
 
                 db_event = Event(
                     project_id=project_id,
@@ -94,30 +129,39 @@ class EventService:
                     input_hash=event_data.input_hash,
                 )
                 db_events.append(db_event)
-                
-                # Collect pattern for later batch recording
-                if event_data.input_hash:
-                    pattern_records.append(
-                        (event_data.agent_name, event_data.input_hash, final_cost)
-                    )
 
-            # Batch-record patterns in one pass (still individual inserts but
-            # avoids interleaving with pricing queries)
-            for agent_name, input_hash, cost in pattern_records:
-                await pattern_service.record_pattern(
-                    project_id=project_id,
-                    agent_name=agent_name,
-                    input_hash=input_hash,
-                    cost=cost,
-                )
-            
-            self.db.add_all(db_events)
-            await self.db.flush()  # Let get_db handle the final commit
+                # Fold repeats of the same pattern together instead of
+                # emitting one SELECT + flush per event.
+                if event_data.input_hash:
+                    key = (event_data.agent_name, event_data.input_hash)
+                    occurrences, summed = pattern_counts.get(key, (0, 0.0))
+                    pattern_counts[key] = (occurrences + 1, summed + final_cost)
         finally:
             await pricing_service.close()
-        
-        return len(db_events)
-    
+
+        return PreparedBatch(
+            project_id=project_id,
+            rows=db_events,
+            pattern_counts=pattern_counts,
+            total_cost=round(total_cost, _COST_PRECISION),
+        )
+
+    async def persist_events_batch(self, prepared: PreparedBatch) -> int:
+        """Write a prepared batch. Caller's transaction owns the commit."""
+        from .baseline_service import PatternAnalysisService
+
+        if not prepared.rows:
+            return 0
+
+        self.db.add_all(prepared.rows)
+        await PatternAnalysisService(self.db).record_patterns_bulk(
+            project_id=prepared.project_id,
+            pattern_counts=prepared.pattern_counts,
+        )
+        await self.db.flush()  # Let get_db handle the final commit
+
+        return len(prepared.rows)
+
     async def get_events(
         self,
         project_id: str,
@@ -213,7 +257,6 @@ class ProjectService:
             description=description,
             owner_id=owner_id,
         )
-        # Override the default API key with our hashed version
         project.api_key = hashed_key
         
         self.db.add(project)

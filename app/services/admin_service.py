@@ -26,7 +26,7 @@ from ..models.db_models import (
     ProjectBaseline,
 )
 from ..models.user_models import PendingEmailInvitation, User, UserSession
-from ..services.email_service import send_admin_email, send_account_deletion_email
+from ..services.email_service import send_account_deletion_email
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 async def log_admin_action(
     db: AsyncSession,
     *,
-    admin_id: str,
+    admin_id: Optional[str],
     action_type: str,
     target_type: Optional[str] = None,
     target_id: Optional[str] = None,
@@ -269,9 +269,13 @@ async def delete_user_permanently(
     )
 
     # Audit log (before the user row disappears)
+    # admin_id is a FK to users.id, so an unattended purge must write NULL
+    # (the column is nullable and the log query outer-joins). A sentinel
+    # string satisfies SQLite in tests but violates the FK on PostgreSQL,
+    # which aborted every scheduled purge.
     await log_admin_action(
         db,
-        admin_id=admin.id if admin else "SYSTEM",
+        admin_id=admin.id if admin else None,
         action_type="user_deleted",
         target_type="user",
         target_id=user_id,
@@ -279,6 +283,7 @@ async def delete_user_permanently(
             "email": user_email,
             "permanent": True,
             "projects_deleted": len(owned_ids) if owned_ids else 0,
+            "actor": admin.id if admin else "system",
         },
         ip_address=ip_address,
     )

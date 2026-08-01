@@ -26,6 +26,11 @@ resend>=2.0.0
 # File storage
 aiofiles>=23.2.0
 
+# Rate limiting (only imported when RATE_LIMIT_BACKEND=redis; the limiter falls
+# back to in-memory counters if this is missing, which silently gives each
+# uvicorn worker its own limits)
+redis>=5.0.0
+
 # Utilities
 python-dotenv>=1.0.0
 

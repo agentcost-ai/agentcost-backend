@@ -4,6 +4,8 @@ AgentCost Backend - Events API Routes
 Endpoints for event ingestion.
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timezone
@@ -18,6 +20,18 @@ from ..config import get_settings
 
 router = APIRouter(prefix="/v1/events", tags=["Events"])
 
+logger = logging.getLogger(__name__)
+
+
+def _ingest_failed(stage: str, exc: Exception) -> HTTPException:
+    """Generic 500 for a failed ingest: no internals reach the client, and a
+    500 is retryable, which is right for a transient pricing or DB fault."""
+    logger.exception("Error %s events: %s", stage, exc)
+    return HTTPException(
+        status_code=500,
+        detail="Failed to process events. Please try again later.",
+    )
+
 
 @router.post("/batch", response_model=EventBatchResponse)
 async def ingest_events_batch(
@@ -27,16 +41,21 @@ async def ingest_events_batch(
 ):
     """
     Ingest a batch of events.
-    
+
     This is the main endpoint called by the AgentCost SDK.
     Events are stored and processed for analytics.
+
+    Malformed events are dropped individually and reported back; the batch as
+    a whole still succeeds so the SDK does not retry a payload it can never
+    get accepted.
     """
-    # M7 fix: enforce config.max_batch_size at runtime
+    # M7 fix: enforce config.max_batch_size at runtime.
+    # Counted against what was *sent*, not what survived validation.
     settings = get_settings()
-    if len(request.events) > settings.max_batch_size:
+    if request.received_count > settings.max_batch_size:
         raise HTTPException(
             status_code=422,
-            detail=f"Batch too large: {len(request.events)} events exceeds maximum of {settings.max_batch_size}.",
+            detail=f"Batch too large: {request.received_count} events exceeds maximum of {settings.max_batch_size}.",
         )
 
     # Verify project_id matches
@@ -46,10 +65,57 @@ async def ingest_events_batch(
             detail="Project ID does not match API key.",
         )
 
+    if request.rejected:
+        logger.warning(
+            "Dropped %d malformed event(s) for project %s: %s",
+            len(request.rejected),
+            project.id,
+            request.rejected[0].reason,
+        )
+
+    def _response(stored: int) -> EventBatchResponse:
+        return EventBatchResponse(
+            status="ok",
+            events_stored=stored,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            events_received=request.received_count,
+            events_rejected=len(request.rejected),
+            # Enough to debug with, without echoing a whole junk batch back.
+            rejected=request.rejected[:10],
+        )
+
+    if not request.events:
+        return _response(0)
+
+    event_service = EventService(db)
     budget_service = BudgetService(db)
-    incoming_cost = sum(max(float(event.cost), 0.0) for event in request.events)
-    budget_eval = await budget_service.evaluate(project, additional_cost=incoming_cost)
-    if budget_eval.get("should_block"):
+
+    try:
+        prepared = await event_service.prepare_events_batch(
+            project_id=project.id,
+            events=request.events,
+        )
+    except Exception as exc:
+        raise _ingest_failed("pricing", exc) from exc
+
+    budget_eval = None
+    if BudgetService.has_budget(project):
+        # Skipped wholesale for projects without a budget: evaluate() is a
+        # month-to-date SUM(cost) plus an FX lookup, on every batch.
+        try:
+            budget_eval = await budget_service.evaluate(
+                project,
+                additional_cost=prepared.total_cost,
+                hot_path=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Fail open: a broken budget check must not cost the user telemetry.
+            logger.warning("Budget evaluation failed for project %s: %s", project.id, exc)
+
+    # Deliberate check-then-act: concurrent batches can overshoot a hard cap by
+    # roughly the value of what is in flight, which is cheaper than serializing
+    # every ingest on the project row.
+    if budget_eval and budget_eval.get("should_block"):
         raise HTTPException(
             status_code=429,
             detail=(
@@ -57,18 +123,19 @@ async def ingest_events_batch(
                 "budget mode to 'warn' to continue ingesting events."
             ),
         )
-    
-    try:
-        # Store events
-        event_service = EventService(db)
-        count = await event_service.create_events_batch(
-            project_id=project.id,
-            events=request.events,
-        )
 
-        # Record newly crossed thresholds for this month (deduplicated).
-        # Fan-out to in-app notifications + email for owners/admins.
-        if budget_eval.get("enabled") and budget_eval.get("crossed_thresholds"):
+    try:
+        count = await event_service.persist_events_batch(prepared)
+    except Exception as exc:
+        raise _ingest_failed("ingesting", exc) from exc
+
+    # Record newly crossed thresholds for this month (deduplicated).
+    # Fan-out to in-app notifications + email for owners/admins.
+    # Deliberately outside the ingest try-block and swallowing its own errors:
+    # the events are already flushed and an alerting failure must not turn a
+    # successful ingest into a 500 that rolls them back.
+    if budget_eval and budget_eval.get("enabled") and budget_eval.get("crossed_thresholds"):
+        try:
             await budget_service.record_threshold_crossings(
                 project_id=project.id,
                 period_key=budget_eval["period_key"],
@@ -78,22 +145,12 @@ async def ingest_events_batch(
                 utilization_percent=budget_eval["utilization_percent"],
                 project=project,
             )
-        
-        return EventBatchResponse(
-            status="ok",
-            events_stored=count,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        )
-    except Exception as e:
-        # Log error internally for debugging
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.exception("Error ingesting events: %s", str(e))
-        # Return generic message to client - no internal details exposed
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to process events. Please try again later."
-        )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Budget threshold recording failed for project %s: %s", project.id, exc
+            )
+
+    return _response(count)
 
 
 @router.get("", response_model=list[EventResponse])

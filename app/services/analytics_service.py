@@ -7,10 +7,10 @@ Business logic for analytics queries.
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, case
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Dict, Any
+from typing import List, Optional
 
 from ..models.db_models import Event
-from ..config import get_settings
+from ..utils.sql_dialect import as_utc_datetime, dialect_name, utc_timestamp
 from ..models.schemas import (
     AnalyticsOverview,
     AgentStats,
@@ -22,10 +22,11 @@ from ..models.schemas import (
 
 class AnalyticsService:
     """Service for analytics queries"""
-    
+
     def __init__(self, db: AsyncSession):
         self.db = db
-    
+        self._dialect = dialect_name(db)
+
     async def get_overview(
         self,
         project_id: str,
@@ -71,7 +72,8 @@ class AnalyticsService:
         
         avg_cost_per_call = total_cost / total_calls if total_calls > 0 else 0.0
         avg_tokens_per_call = total_tokens / total_calls if total_calls > 0 else 0.0
-        success_rate = (success_count / total_calls * 100) if total_calls > 0 else 100.0
+        # No calls means no successes to rate, so 0% rather than a vacuous 100%.
+        success_rate = (success_count / total_calls * 100) if total_calls > 0 else 0.0
         
         return AnalyticsOverview(
             total_cost=round(total_cost, 6),
@@ -133,8 +135,8 @@ class AnalyticsService:
             total_cost = float(row.total_cost) if row.total_cost is not None else 0.0
             avg_latency = float(row.avg_latency) if row.avg_latency is not None else 0.0
             success_count = int(row.success_count) if row.success_count is not None else 0
-            success_rate = (success_count / total_calls * 100) if total_calls > 0 else 100.0
-            
+            success_rate = (success_count / total_calls * 100) if total_calls > 0 else 0.0
+
             agents.append(AgentStats(
                 agent_name=row.agent_name,
                 total_calls=total_calls,
@@ -145,23 +147,60 @@ class AnalyticsService:
             ))
         
         return agents
-    
+
+    async def get_distinct_model_count(
+        self,
+        project_id: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> int:
+        """
+        How many distinct models ran in the window, including the top-N tail.
+
+        Quoting the length of a top-N list instead makes "3 of 10 models drive
+        80% of spend" appear for a project that actually runs 40.
+        """
+        query = select(func.count(func.distinct(Event.model))).where(
+            Event.project_id == project_id,
+            Event.timestamp >= start_time,
+            Event.timestamp <= end_time,
+        )
+        return int((await self.db.execute(query)).scalar() or 0)
+
+    async def _window_cost(
+        self,
+        project_id: str,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> float:
+        """Total spend over the whole filtered window."""
+        query = select(func.sum(Event.cost)).where(
+            Event.project_id == project_id,
+            Event.timestamp >= start_time,
+            Event.timestamp <= end_time,
+        )
+        return float((await self.db.execute(query)).scalar() or 0.0)
+
     async def get_model_stats(
         self,
         project_id: str,
         start_time: datetime,
         end_time: datetime,
         limit: int = 10,
+        window_cost: Optional[float] = None,
     ) -> List[ModelStats]:
         """
         Get per-model statistics.
-        
+
         Args:
             project_id: Project ID
             start_time: Period start
             end_time: Period end
             limit: Max models to return
-            
+            window_cost: Spend over the whole window, used as the cost_share
+                denominator. Pass it when the caller has already summed the same
+                window; omit it and this queries for it.
+
         Returns:
             List of ModelStats
         """
@@ -184,15 +223,17 @@ class AnalyticsService:
         ).limit(limit)
         
         result = await self.db.execute(query)
-        
-        # First pass: collect all models and calculate total cost
-        rows_data = []
-        total_cost_all = 0.0
-        for row in result:
-            rows_data.append(row)
-            row_cost = float(row.total_cost) if row.total_cost is not None else 0.0
-            total_cost_all += row_cost
-        
+        rows_data = list(result)
+
+        # Share is against every model in the window, including the tail the
+        # limit above truncated: renormalizing over the slice would make the
+        # listed shares add to 100% however much spend the tail holds.
+        total_cost_all = (
+            window_cost
+            if window_cost is not None
+            else await self._window_cost(project_id, start_time, end_time)
+        )
+
         models = []
         for row in rows_data:
             # Convert Decimal values to int/float for arithmetic operations
@@ -236,18 +277,17 @@ class AnalyticsService:
         Returns:
             List of TimeSeriesPoint
         """
-        # For SQLite, we use strftime. For PostgreSQL, use date_trunc
-        _settings = get_settings()
-        is_sqlite = "sqlite" in _settings.database_url
+        # Bucket in UTC, matching the UTC window bounds above.
+        ts = utc_timestamp(self._dialect)
         if granularity == "day":
-            time_bucket = func.date(Event.timestamp)
+            time_bucket = func.date(ts)
         else:
             # Hour granularity
-            if is_sqlite:
-                time_bucket = func.strftime('%Y-%m-%d %H:00:00', Event.timestamp)
+            if self._dialect == "sqlite":
+                time_bucket = func.strftime('%Y-%m-%d %H:00:00', ts)
             else:
-                time_bucket = func.date_trunc('hour', Event.timestamp)
-        
+                time_bucket = func.date_trunc('hour', ts)
+
         query = select(
             time_bucket.label('time_bucket'),
             func.count(Event.id).label('calls'),
@@ -268,12 +308,10 @@ class AnalyticsService:
         
         timeseries = []
         for row in result:
-            # Parse timestamp
-            if isinstance(row.time_bucket, str):
-                ts = datetime.fromisoformat(row.time_bucket)
-            else:
-                ts = row.time_bucket
-            
+            # Buckets come back as text (SQLite), date or naive datetime (PG);
+            # all of them are UTC, so label them as such.
+            ts = as_utc_datetime(row.time_bucket)
+
             # Convert Decimal values to int/float for arithmetic operations
             calls = int(row.calls) if row.calls is not None else 0
             tokens = int(row.tokens) if row.tokens is not None else 0

@@ -4,7 +4,15 @@ AgentCost Backend - Pydantic Schemas
 Request/Response models for API validation.
 """
 
-from pydantic import BaseModel, Field, field_validator, ConfigDict, EmailStr
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+    ConfigDict,
+    EmailStr,
+    PrivateAttr,
+    ValidationError,
+)
 from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime, timezone
 from pydantic import model_validator
@@ -12,14 +20,16 @@ from pydantic import model_validator
 
 class EventCreate(BaseModel):
     """Schema for a single event in batch"""
-    
+
     agent_name: str = Field(default="default", max_length=255)
     model: str = Field(..., max_length=100)
     input_tokens: int = Field(..., ge=0)
     output_tokens: int = Field(..., ge=0)
-    total_tokens: int = Field(..., ge=0)
-    cost: float = Field(..., ge=0)
-    latency_ms: int = Field(..., ge=0)
+    # Optional: the server derives total_tokens and re-prices cost itself, so
+    # requiring them would only reject batches it can already handle.
+    total_tokens: Optional[int] = Field(default=None, ge=0)
+    cost: float = Field(default=0.0, ge=0)
+    latency_ms: int = Field(default=0, ge=0)
     timestamp: str
     success: bool = True
     error: Optional[str] = None
@@ -38,24 +48,117 @@ class EventCreate(BaseModel):
             raise ValueError('Invalid timestamp format. Use ISO 8601.')
 
 
+class RejectedEvent(BaseModel):
+    """An event that failed validation, echoed back so clients can fix it."""
+
+    index: int
+    reason: str
+
+
+# Enough for a client to fix the event without echoing its whole error list back.
+_MAX_REASONS_PER_EVENT = 3
+
+# Upper safety net on a single batch. Kept as a constant because it is enforced
+# in two places that must not drift: the field constraint below and the
+# early size check in partition_events.
+_MAX_EVENTS_PER_BATCH = 1000
+
+
+def _describe(exc: ValidationError) -> str:
+    """One-line, client-facing summary of why an event failed validation."""
+    return "; ".join(
+        f"{'.'.join(str(part) for part in err['loc']) or 'event'}: {err['msg']}"
+        for err in exc.errors()[:_MAX_REASONS_PER_EVENT]
+    )
+
+
 class EventBatchRequest(BaseModel):
     """Request body for batch event ingestion
-    
+
     Note: The effective max batch size is enforced by config.max_batch_size
-    (default 100) at the route level. The schema allows up to 1000 as an
-    upper safety net.
+    (default 100) at the route level against ``received_count``. The schema
+    allows up to 1000 as an upper safety net.
     """
-    
+
     project_id: str = Field(..., min_length=1)
-    events: List[EventCreate] = Field(..., min_length=1, max_length=1000)
+    events: List[EventCreate] = Field(..., max_length=_MAX_EVENTS_PER_BATCH)
+
+    # Outputs of the partitioning validator, not things a client sends: private
+    # so they stay out of the generated request-body schema. ``events`` may end
+    # up empty here even though the request must carry at least one event.
+    _rejected: List[RejectedEvent] = PrivateAttr(default_factory=list)
+    _received_count: int = PrivateAttr(default=0)
+
+    @property
+    def rejected(self) -> List[RejectedEvent]:
+        """The events that failed validation and were dropped."""
+        return self._rejected
+
+    @property
+    def received_count(self) -> int:
+        """How many events the client sent, before any were dropped."""
+        return self._received_count
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def partition_events(cls, data: Any, handler) -> "EventBatchRequest":
+        """Validate events one by one instead of all-or-nothing.
+
+        With a plain ``List[EventCreate]`` a single malformed event 422s the
+        batch and stores *nothing*. The SDK re-queues the identical payload
+        every flush interval (agentcost-sdk/batcher.py), so one permanently
+        invalid event blocks the retry queue forever and real events are
+        dropped once that queue hits max_retry_batches. Take what parses and
+        report the rest.
+        """
+        if not isinstance(data, dict):
+            return handler(data)
+
+        raw = data.get("events")
+        if raw is None or (isinstance(raw, list) and not raw):
+            raise ValueError("At least one event is required.")
+        if not isinstance(raw, list):
+            return handler(data)  # wrong type entirely — let field validation say so
+
+        # Size-check before the loop, not after. A wrap validator runs ahead of
+        # field validation, so the ``max_length`` above is only consulted at the
+        # handler() call below — by which point every event in an oversized
+        # batch has already been parsed individually. Before this validator
+        # existed, pydantic-core rejected an over-long list without looking at
+        # its items; this check restores that.
+        if len(raw) > _MAX_EVENTS_PER_BATCH:
+            raise ValueError(
+                f"Batch too large: {len(raw)} events (max {_MAX_EVENTS_PER_BATCH})."
+            )
+
+        valid: List[EventCreate] = []
+        rejected: List[RejectedEvent] = []
+        for index, item in enumerate(raw):
+            try:
+                valid.append(EventCreate.model_validate(item))
+            except ValidationError as exc:
+                rejected.append(RejectedEvent(index=index, reason=_describe(exc)))
+
+        request = handler({**data, "events": valid})
+        request._rejected = rejected
+        request._received_count = len(raw)
+        return request
 
 
 class EventBatchResponse(BaseModel):
-    """Response for batch event ingestion"""
-    
+    """Response for batch event ingestion
+
+    ``status``/``events_stored``/``timestamp`` are the contract the SDK parses
+    (it only treats ``status == "ok"`` as success); the rejection fields are
+    additive so older SDKs keep working.
+    """
+
     status: str = "ok"
     events_stored: int
     timestamp: str
+    events_received: int = 0
+    events_rejected: int = 0
+    rejected: List[RejectedEvent] = Field(default_factory=list)
 
 
 class EventResponse(BaseModel):

@@ -2,7 +2,6 @@
 
 from datetime import datetime, timezone
 from typing import Optional
-import hashlib
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials

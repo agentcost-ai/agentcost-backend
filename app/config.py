@@ -4,11 +4,9 @@ AgentCost Backend Configuration
 Loads settings from environment variables.
 """
 
-import os
 import secrets
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import Optional, List
 from functools import lru_cache
 
 
@@ -66,10 +64,13 @@ class Settings(BaseSettings):
     max_batch_size: int = 100  # max events per batch request
     
     # Pricing sync settings
-    # Auto-sync pricing from LiteLLM on startup
-    # Set to False in production - use POST /v1/pricing/sync/litellm from Admin Dashboard instead
+    # Also attempt a sync shortly after startup, in the background. Still
+    # subject to pricing_sync_interval_hours, so a host that restarts often
+    # does not re-sync every wake.
     auto_sync_pricing_on_startup: bool = False
-    # Sync interval in hours (0 = no background sync, just startup)
+    # Minimum hours between background syncs, measured from the last successful
+    # run recorded in pricing_sync_log. 0 disables background syncing entirely;
+    # POST /v1/pricing/sync/litellm always works regardless.
     pricing_sync_interval_hours: int = 24
     
     # Google OAuth
@@ -126,6 +127,13 @@ class Settings(BaseSettings):
     
     # Request size limit (MB) - protects against oversized payloads
     max_request_size_mb: int = 10
+
+    # How many proxies/load balancers sit in front of this app. The rate
+    # limiter counts this many hops back from the RIGHT of X-Forwarded-For,
+    # because only the entries appended by our own infrastructure are
+    # trustworthy - anything further left was supplied by the caller. Set to 0
+    # when the app is exposed directly, so X-Forwarded-For is ignored entirely.
+    trusted_proxy_hops: int = 1
     
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -158,8 +166,3 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Get cached settings instance"""
     return Settings()
-
-
-def clear_settings_cache():
-    """Clear cached settings (useful for testing)"""
-    get_settings.cache_clear()

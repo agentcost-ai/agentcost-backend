@@ -10,9 +10,9 @@ This creates a self-improving system where alternatives get better over time.
 """
 
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_, or_
+from sqlalchemy import select, func
 
 from ..models.db_models import ModelPricing, ModelAlternative
 

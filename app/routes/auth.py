@@ -3,7 +3,7 @@
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, status, Request, Header
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import Optional, Annotated
@@ -17,13 +17,13 @@ from ..models.auth_schemas import (
     RefreshTokenRequest, PolicyCheckResponse, PolicyConsentInput,
     GoogleAuthRequest, GitHubAuthRequest
 )
-from ..services.auth_service import AuthService, get_current_user, decode_token, verify_google_id_token, exchange_github_code
+from ..services.auth_service import AuthService, decode_token, verify_google_id_token, exchange_github_code
 from ..services.email_service import send_verification_email, send_password_reset_email, send_welcome_email
 from ..services.member_service import MemberService
 from ..models.user_models import User
 from ..models.db_models import UserMilestone
 from ..config import get_settings
-from ..utils.auth import get_required_user, get_optional_user
+from ..utils.auth import get_required_user
 
 
 router = APIRouter(prefix="/v1/auth", tags=["Authentication"])
@@ -680,7 +680,7 @@ async def verify_email(
                 milestone_badge=user.milestone_badge,
             )
             if sent:
-                from sqlalchemy import update, select
+                from sqlalchemy import update
                 await auth_service.db.execute(
                     update(UserMilestone)
                     .where(

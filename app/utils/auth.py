@@ -47,15 +47,6 @@ def generate_secure_api_key() -> Tuple[str, str]:
     return plaintext_key, hashed_key
 
 
-def verify_api_key(plaintext_key: str, stored_hash: str) -> bool:
-    """
-    Verify an API key against its stored hash.
-    
-    Uses constant-time comparison to prevent timing attacks.
-    """
-    computed_hash = hash_api_key(plaintext_key)
-    return secrets.compare_digest(computed_hash, stored_hash)
-
 # API Key in header
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
@@ -139,8 +130,11 @@ async def _resolve_project_access(
             raise HTTPException(status_code=401, detail="Invalid API key.")
         if not project.is_active:
             raise HTTPException(status_code=403, detail="Project is disabled.")
-        # When the route also has a path-scoped project_id, ensure it matches.
-        if project_id and project_id != project.id:
+        # ``is not None``, not truthiness: an empty ``?project_id=`` is a
+        # request for a project that cannot match this key, so it belongs in
+        # the mismatch branch rather than skipping the check. Only omitting the
+        # parameter entirely -- the SDK's usage -- means "no scope requested".
+        if project_id is not None and project_id != project.id:
             raise HTTPException(
                 status_code=403,
                 detail="API key does not match the requested project.",

@@ -7,7 +7,6 @@ Pydantic models for auth requests and responses.
 from pydantic import BaseModel, Field, EmailStr, field_validator, ConfigDict
 from typing import Optional, List
 from datetime import datetime
-import re
 
 from ..common import validate_password_strength
 

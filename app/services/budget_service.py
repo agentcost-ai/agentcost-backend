@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models.db_models import BudgetThresholdAlert, Event, Project
@@ -40,6 +41,17 @@ class BudgetService:
     @staticmethod
     def _period_key(now: datetime) -> str:
         return f"{now.year:04d}-{now.month:02d}"
+
+    @staticmethod
+    def has_budget(project: Project) -> bool:
+        """Whether this project has a budget worth evaluating.
+
+        Lets the ingestion path skip ``evaluate`` entirely — that call costs a
+        month-to-date ``SUM(cost)`` plus an FX lookup on *every* batch, and for
+        the overwhelming majority of projects (no budget set) the answer is
+        always "not enforced".
+        """
+        return float(project.monthly_budget_usd or 0.0) > 0
 
     @staticmethod
     def normalize_thresholds(raw: Any) -> list[float]:
@@ -72,7 +84,13 @@ class BudgetService:
         )
         return float(result.scalar() or 0.0)
 
-    async def evaluate(self, project: Project, additional_cost: float = 0.0) -> dict[str, Any]:
+    async def evaluate(
+        self,
+        project: Project,
+        additional_cost: float = 0.0,
+        *,
+        hot_path: bool = False,
+    ) -> dict[str, Any]:
         """
         Evaluate the project's budget against month-to-date spend.
 
@@ -80,12 +98,19 @@ class BudgetService:
         and the returned spend figures are expressed in the project's
         ``budget_currency``; ``CurrencyService`` converts USD spend into that
         currency before the comparison.
+
+        ``hot_path=True`` (event ingestion) takes the cached FX rate instead of
+        one that may block on the FX provider — see CurrencyService.
         """
         budget = float(project.monthly_budget_usd or 0.0)
         mode = (project.budget_enforcement_mode or "off").lower()
         thresholds = self.normalize_thresholds(project.budget_alert_thresholds)
         currency = CurrencyService.normalize(getattr(project, "budget_currency", "USD"))
-        fx_rate = await CurrencyService.usd_to(currency)
+        fx_rate = (
+            CurrencyService.cached_usd_to(currency)
+            if hot_path
+            else await CurrencyService.usd_to(currency)
+        )
 
         now = datetime.now(timezone.utc)
         current_spend_usd = await self.get_monthly_spend(project.id, now)
@@ -130,6 +155,20 @@ class BudgetService:
             "fx_rate": fx_rate,
         }
 
+    async def _existing_thresholds(self, project_id: str, period_key: str) -> set[float]:
+        """Thresholds already alerted on for this project/month.
+
+        Only a fast path: a concurrent writer can insert between this read and
+        our own insert, which is why the insert itself is savepoint-guarded.
+        """
+        existing_rows = await self.db.execute(
+            select(BudgetThresholdAlert.threshold_percent).where(
+                BudgetThresholdAlert.project_id == project_id,
+                BudgetThresholdAlert.period_key == period_key,
+            )
+        )
+        return {round(float(v), 2) for v in existing_rows.scalars().all()}
+
     async def record_threshold_crossings(
         self,
         project_id: str,
@@ -145,13 +184,7 @@ class BudgetService:
         if not crossed_thresholds:
             return []
 
-        existing_rows = await self.db.execute(
-            select(BudgetThresholdAlert.threshold_percent).where(
-                BudgetThresholdAlert.project_id == project_id,
-                BudgetThresholdAlert.period_key == period_key,
-            )
-        )
-        existing = {round(float(v), 2) for v in existing_rows.scalars().all()}
+        existing = await self._existing_thresholds(project_id, period_key)
 
         inserted: list[float] = []
         for threshold in crossed_thresholds:
@@ -167,11 +200,27 @@ class BudgetService:
                 budget_amount=round(float(budget_amount), 6),
                 utilization_percent=round(float(utilization_percent), 2),
             )
-            self.db.add(row)
-            inserted.append(normalized)
+            # SAVEPOINT per row. The SELECT above is check-then-insert against a
+            # UNIQUE index, so two flushes crossing the same threshold at once
+            # both pass the check and one hits an IntegrityError. Without the
+            # savepoint that error poisons the request's transaction and rolls
+            # back the *events* that were just ingested — alerting must never
+            # be able to destroy telemetry.
+            try:
+                async with self.db.begin_nested():
+                    self.db.add(row)
+                    await self.db.flush()
+            except IntegrityError:
+                # The other writer recorded this crossing; it owns the alert.
+                logger.debug(
+                    "Budget threshold %s already recorded for %s/%s",
+                    normalized,
+                    project_id,
+                    period_key,
+                )
+                continue
 
-        if inserted:
-            await self.db.flush()
+            inserted.append(normalized)
 
         if inserted and dispatch_notifications:
             try:

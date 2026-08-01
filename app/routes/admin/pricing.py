@@ -3,10 +3,11 @@ Admin routes -- pricing intelligence and sync.
 """
 
 import time
-from typing import Optional, Dict, Any
+from typing import Optional
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, desc
 
@@ -18,6 +19,24 @@ from ...services.admin_service import log_admin_action
 from ._deps import require_superuser
 
 router = APIRouter()
+
+# Sanity ceiling for a hand-entered rate. The dearest real model today is well
+# under $1 per 1k tokens, so anything above this is a unit mistake (per-million
+# rates pasted into a per-1k field) rather than a real price. These values are
+# re-applied to every ingested event's stored cost, so a bad one is not an
+# estimate — it is permanently baked into customers' history.
+MAX_PRICE_PER_1K = 10.0
+
+
+class ModelPricingUpdate(BaseModel):
+    """Admin-supplied pricing override. Omitted fields are left unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_price_per_1k: Optional[float] = Field(None, ge=0, le=MAX_PRICE_PER_1K)
+    output_price_per_1k: Optional[float] = Field(None, ge=0, le=MAX_PRICE_PER_1K)
+    is_active: Optional[bool] = None
+    notes: Optional[str] = Field(None, max_length=1000)
 
 
 @router.get("/pricing/models")
@@ -113,14 +132,15 @@ async def list_pricing_providers(
 @router.patch("/pricing/models/{model_id}")
 async def update_model_pricing(
     model_id: int,
-    body: Dict[str, Any] = Body(...),
+    body: ModelPricingUpdate,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     admin: User = Depends(require_superuser),
 ):
     """
     Admin override for model pricing.
     Supports: input_price_per_1k, output_price_per_1k, is_active, notes.
-    Sets pricing_source to 'admin_override'.
+    Sets pricing_source to 'admin_override' when a price actually changes.
     """
     model = (await db.execute(
         select(ModelPricing).where(ModelPricing.id == model_id)
@@ -128,13 +148,46 @@ async def update_model_pricing(
     if not model:
         raise HTTPException(status_code=404, detail="Model pricing not found")
 
-    allowed = {"input_price_per_1k", "output_price_per_1k", "is_active", "notes"}
-    for field in allowed:
-        if field in body:
-            setattr(model, field, body[field])
+    # exclude_unset so an omitted field keeps its stored value rather than
+    # being overwritten with None.
+    changes = body.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="No fields to update.")
 
-    model.pricing_source = "admin_override"
-    model.source_updated_at = datetime.now(timezone.utc)
+    before = {}
+    for field, value in changes.items():
+        current = getattr(model, field)
+        if current != value:
+            before[field] = current
+            setattr(model, field, value)
+
+    if not before:
+        return {
+            "id": model.id,
+            "model_name": model.model_name,
+            "pricing_source": model.pricing_source,
+            "message": "No changes",
+        }
+
+    # Only claim an override when a price moved. is_active/notes edits should
+    # not stop the next sync from correcting this row's rates.
+    if {"input_price_per_1k", "output_price_per_1k"} & before.keys():
+        model.pricing_source = "admin_override"
+        model.source_updated_at = datetime.now(timezone.utc)
+
+    await log_admin_action(
+        db,
+        admin_id=admin.id,
+        action_type="model_pricing_updated",
+        target_type="model_pricing",
+        target_id=str(model.id),
+        details={
+            "model_name": model.model_name,
+            "before": before,
+            "after": {field: changes[field] for field in before},
+        },
+        ip_address=request.client.host if request.client else None,
+    )
 
     await db.commit()
     await db.refresh(model)
@@ -204,6 +257,9 @@ async def sync_litellm_pricing(
             error_message=str(exc),
             duration_ms=duration_ms,
         )
+        # Discard the partially-applied price changes before recording the
+        # failure; committing here would persist them while logging an error.
+        await db.rollback()
         db.add(log_entry)
         await db.commit()
         raise
@@ -263,6 +319,9 @@ async def sync_openrouter_pricing(
             error_message=str(exc),
             duration_ms=duration_ms,
         )
+        # Discard the partially-applied price changes before recording the
+        # failure; committing here would persist them while logging an error.
+        await db.rollback()
         db.add(log_entry)
         await db.commit()
         raise

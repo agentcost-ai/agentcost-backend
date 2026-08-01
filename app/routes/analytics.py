@@ -27,9 +27,11 @@ router = APIRouter(prefix="/v1/analytics", tags=["Analytics"])
 
 
 def parse_time_range(range_str: str) -> tuple[datetime, datetime]:
-    """Parse time range string into start/end datetimes"""
-    end_time = datetime.now(timezone.utc)
-    
+    """Parse a time range string into start/end datetimes, snapping the end up
+    to the next minute so a dashboard's parallel requests share one window."""
+    now = datetime.now(timezone.utc)
+    end_time = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+
     if range_str == "1h":
         start_time = end_time - timedelta(hours=1)
     elif range_str == "24h":

@@ -3,14 +3,15 @@
 # Computes statistical baselines for anomaly detection and pattern analysis.
 # Uses standard deviation and percentile-based thresholds instead of hardcoded values.
 
-import hashlib
 from datetime import datetime, timezone, timedelta, date
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, case, text
+from sqlalchemy import select, func, case
+
+from ..utils.sql_dialect import dialect_name, stddev_pop
 
 
 from ..models.db_models import (
@@ -18,7 +19,6 @@ from ..models.db_models import (
     ProjectBaseline, 
     InputPatternCache,
     OptimizationRecommendation,
-    ModelPricing,
 )
 
 
@@ -71,7 +71,9 @@ class BaselineService:
         """
         end_time = datetime.now(timezone.utc)
         start_time = end_time - timedelta(days=days)
-        
+
+        dialect = dialect_name(self.db)
+
         # Compute baselines per agent/model combination
         query = select(
             Event.agent_name,
@@ -81,31 +83,12 @@ class BaselineService:
             func.avg(Event.input_tokens).label('avg_input'),
             func.avg(Event.output_tokens).label('avg_output'),
             func.avg(Event.latency_ms).label('avg_latency'),
-            # Standard deviations using SQL
-            func.coalesce(
-                func.sqrt(
-                    func.avg(Event.cost * Event.cost) - 
-                    func.avg(Event.cost) * func.avg(Event.cost)
-                ), 0
-            ).label('stddev_cost'),
-            func.coalesce(
-                func.sqrt(
-                    func.avg(Event.input_tokens * Event.input_tokens) - 
-                    func.avg(Event.input_tokens) * func.avg(Event.input_tokens)
-                ), 0
-            ).label('stddev_input'),
-            func.coalesce(
-                func.sqrt(
-                    func.avg(Event.output_tokens * Event.output_tokens) - 
-                    func.avg(Event.output_tokens) * func.avg(Event.output_tokens)
-                ), 0
-            ).label('stddev_output'),
-            func.coalesce(
-                func.sqrt(
-                    func.avg(Event.latency_ms * Event.latency_ms) - 
-                    func.avg(Event.latency_ms) * func.avg(Event.latency_ms)
-                ), 0
-            ).label('stddev_latency'),
+            # Standard deviations using SQL. See sql_dialect.stddev_pop for why
+            # this is not the inline sqrt(avg(x*x) - avg(x)*avg(x)) it used to be.
+            func.coalesce(stddev_pop(Event.cost, dialect), 0).label('stddev_cost'),
+            func.coalesce(stddev_pop(Event.input_tokens, dialect), 0).label('stddev_input'),
+            func.coalesce(stddev_pop(Event.output_tokens, dialect), 0).label('stddev_output'),
+            func.coalesce(stddev_pop(Event.latency_ms, dialect), 0).label('stddev_latency'),
             # Error rate
             func.sum(case((Event.success == False, 1), else_=0)).label('error_count'),
             # Max latency as p95 approximation (mean + 1.645 * stddev for normal distribution)
@@ -249,9 +232,24 @@ class BaselineService:
             .group_by(func.date(Event.timestamp))
         )
         rows = (await self.db.execute(daily_q)).all()
-        if len(rows) < 2:
+        if not rows:
             return 0.0
+
+        # Pad the days with no events back in as zeros. GROUP BY only returns
+        # days that have rows, so a spread measured over `rows` alone describes
+        # the days this agent actually ran, while the avg_daily_calls it gets
+        # compared against is call_count spread over every calendar day in the
+        # window. Feeding a z-score a mean and a spread taken over different
+        # populations flags any intermittently-scheduled agent as anomalous:
+        # 500 calls over 5 of 30 days gives mean 16.7, spread 7.1, z = 11.8,
+        # far past ANOMALY_THRESHOLD_MEDIUM (2.0) where flagging starts.
+        # Padding puts both on the calendar-day population, so this mean
+        # matches call_count / days exactly.
         counts = [float(r.cnt) for r in rows]
+        counts.extend([0.0] * max(0, days - len(counts)))
+        if len(counts) < 2:
+            return 0.0
+
         mean = sum(counts) / len(counts)
         variance = sum((c - mean) ** 2 for c in counts) / len(counts)
         return variance ** 0.5
@@ -442,66 +440,73 @@ class PatternAnalysisService:
     def __init__(self, db: AsyncSession):
         self.db = db
     
-    def _hash_input(self, input_text: str) -> str:
-        """Create a normalized hash of input for pattern matching."""
-        # Normalize: lowercase, strip whitespace, remove common variable parts
-        normalized = input_text.lower().strip()
-        return hashlib.sha256(normalized.encode()).hexdigest()
-    
-    async def record_pattern(
+    async def record_patterns_bulk(
         self,
         project_id: str,
-        agent_name: str,
-        cost: float,
-        input_text: Optional[str] = None,
-        input_hash: Optional[str] = None,
+        pattern_counts: Dict[Tuple[str, str], Tuple[int, float]],
     ) -> None:
         """
-        Record an input pattern occurrence.
-        
+        Record a whole batch of pattern occurrences in one read + one write pass.
+
         Args:
             project_id: Project ID
-            agent_name: Agent name
-            cost: Cost of the call
-            input_text: Raw input text (will be hashed)
-            input_hash: Pre-computed hash (used if input_text not provided)
+            pattern_counts: (agent_name, input_hash) -> (occurrences, total cost)
         """
-        if input_text:
-            pattern_hash = self._hash_input(input_text)
-        elif input_hash:
-            pattern_hash = input_hash
-        else:
-            # No input data to record
+        if not pattern_counts:
             return
-        
-        query = select(InputPatternCache).where(
-            InputPatternCache.project_id == project_id,
-            InputPatternCache.agent_name == agent_name,
-            InputPatternCache.input_hash == pattern_hash,
-        )
-        result = await self.db.execute(query)
-        existing = result.scalar_one_or_none()
-        
-        if existing:
-            existing.occurrence_count += 1
-            existing.last_seen_at = datetime.now(timezone.utc)
-            existing.total_cost_for_pattern += cost
-            existing.avg_cost_per_occurrence = (
-                existing.total_cost_for_pattern / existing.occurrence_count
+
+        agent_names = {agent for agent, _ in pattern_counts}
+        hashes = {input_hash for _, input_hash in pattern_counts}
+
+        rows = (
+            await self.db.execute(
+                select(InputPatternCache)
+                .where(
+                    InputPatternCache.project_id == project_id,
+                    InputPatternCache.agent_name.in_(agent_names),
+                    InputPatternCache.input_hash.in_(hashes),
+                )
+                .order_by(InputPatternCache.id.asc())
             )
-        else:
-            pattern = InputPatternCache(
-                project_id=project_id,
-                agent_name=agent_name,
-                input_hash=pattern_hash,
-                occurrence_count=1,
-                total_cost_for_pattern=cost,
-                avg_cost_per_occurrence=cost,
+        ).scalars().all()
+
+        # input_pattern_cache carries no unique index, so two concurrent
+        # batches can both insert the same (project, agent, hash) and split the
+        # counter across rows. Fold new occurrences into the oldest row so the
+        # count keeps accumulating in one place instead of fragmenting further.
+        existing: Dict[Tuple[str, str], InputPatternCache] = {}
+        for row in rows:
+            existing.setdefault((row.agent_name, row.input_hash), row)
+
+        now = datetime.now(timezone.utc)
+        for (agent_name, input_hash), (occurrences, cost) in pattern_counts.items():
+            row = existing.get((agent_name, input_hash))
+            if row is None:
+                self.db.add(
+                    InputPatternCache(
+                        project_id=project_id,
+                        agent_name=agent_name,
+                        input_hash=input_hash,
+                        occurrence_count=occurrences,
+                        total_cost_for_pattern=cost,
+                        avg_cost_per_occurrence=cost / occurrences if occurrences else 0.0,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                    )
+                )
+                continue
+
+            row.occurrence_count = (row.occurrence_count or 0) + occurrences
+            row.total_cost_for_pattern = (row.total_cost_for_pattern or 0.0) + cost
+            row.avg_cost_per_occurrence = (
+                row.total_cost_for_pattern / row.occurrence_count
+                if row.occurrence_count
+                else 0.0
             )
-            self.db.add(pattern)
-        
+            row.last_seen_at = now
+
         await self.db.flush()
-    
+
     async def analyze_caching_opportunities(
         self,
         project_id: str,

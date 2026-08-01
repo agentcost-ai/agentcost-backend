@@ -28,7 +28,6 @@ from .routes.demo import router as demo_router
 from .models.schemas import HealthResponse
 from .utils.rate_limiter import RateLimitMiddleware
 from .utils.request_size import RequestSizeLimitMiddleware
-from .services.pricing_service import PricingService
 
 import logging
 import os
@@ -57,23 +56,27 @@ async def lifespan(app: FastAPI):
 
     # Optional: Auto-sync pricing from LiteLLM. Runs in the BACKGROUND so it
     # never blocks application startup / port binding — the sync fetches and
-    # upserts ~2,900 models, which can exceed the platform's start timeout and
+    # upserts ~3,500 models, which can exceed the platform's start timeout and
     # previously hung the deploy at "Waiting for application startup".
+    #
+    # Delegates to sync_pricing_if_due, so a host that sleeps and restarts
+    # repeatedly re-syncs only when the interval has actually elapsed instead
+    # of restarting a full sync on every wake.
     pricing_task = None
     if settings.auto_sync_pricing_on_startup:
+        from .services.cron import sync_pricing_if_due
+
         async def _sync_pricing_background():
-            logger.info("Auto-syncing pricing from LiteLLM (background)...")
             try:
                 async for db in get_db_session():
-                    pricing_service = PricingService(db)
-                    result = await pricing_service.sync_from_litellm(track_changes=False)
-                    await pricing_service.close()
-                    logger.info(
-                        "Pricing sync complete: %d created, %d updated",
-                        result.get("models_created", 0),
-                        result.get("models_updated", 0),
-                    )
+                    await sync_pricing_if_due(db)
                     break
+            except asyncio.CancelledError:
+                # Not caught by `except Exception` — CancelledError derives from
+                # BaseException. Without this the sync disappeared on shutdown
+                # with nothing in the logs, which reads as "it never ran".
+                logger.info("Pricing sync cancelled by shutdown; will retry when due")
+                raise
             except Exception as e:
                 logger.warning("Pricing sync failed: %s", e)
 
@@ -144,6 +147,10 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
 
+    from .utils.rate_limiter import redis_rate_limiter
+    if redis_rate_limiter is not None:
+        await redis_rate_limiter.close()
+
 
 # Create FastAPI app
 app = FastAPI(
@@ -153,7 +160,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware
+# Middleware order matters here. add_middleware inserts at position 0, so the
+# LAST one added is the OUTERMOST. CORS therefore has to be registered after the
+# two middlewares that short-circuit: RateLimitMiddleware's 429 and
+# RequestSizeLimitMiddleware's 413 return without calling the rest of the stack,
+# so if CORS sat inside them those responses would reach the browser with no
+# Access-Control-Allow-Origin and the dashboard would show an opaque network
+# error instead of the real status.
+
+# Rate limiting middleware
+app.add_middleware(RateLimitMiddleware)
+
+# Request size limit middleware
+app.add_middleware(RequestSizeLimitMiddleware)
+
+# CORS middleware - added last so it wraps everything above
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -161,12 +182,6 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-API-Key", "Accept"],
 )
-
-# Rate limiting middleware
-app.add_middleware(RateLimitMiddleware)
-
-# Request size limit middleware
-app.add_middleware(RequestSizeLimitMiddleware)
 
 # Register routes
 app.include_router(auth_router)

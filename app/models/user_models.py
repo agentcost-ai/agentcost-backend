@@ -5,12 +5,10 @@ SQLAlchemy models for user authentication and management.
 """
 
 from sqlalchemy import (
-    Column, String, Integer, Float, Boolean, DateTime, Text, ForeignKey,
-    Index, Enum
+    Column, String, Integer, Boolean, DateTime, Text, ForeignKey, Index
 )
 from sqlalchemy.orm import relationship, backref
 from sqlalchemy.sql import func
-from datetime import datetime
 import enum
 
 from ..database import Base

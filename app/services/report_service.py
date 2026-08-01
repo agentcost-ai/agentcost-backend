@@ -13,19 +13,18 @@ services don't already expose are computed here with new queries.
 """
 
 import logging
+import math
 from datetime import datetime, timezone
-from typing import Any, List
+from typing import List
 
 from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import get_settings
 from ..models.db_models import Event, Project
 from ..models.schemas import (
     AnalyticsOverview,
     AgentStats,
     ModelStats,
-    TimeSeriesPoint,
     MetricDelta,
     ReportSummary,
     LatencyPercentiles,
@@ -41,15 +40,12 @@ from ..models.schemas import (
     SavingsRollup,
     ExecutiveReport,
 )
+from ..utils.sql_dialect import dialect_name, utc_timestamp
 from .analytics_service import AnalyticsService
 from .budget_service import BudgetService
 from .optimization_service import OptimizationService
 
 logger = logging.getLogger(__name__)
-
-# Cap on rows pulled for percentile computation. Beyond this we sample so the
-# report stays responsive on very large projects.
-_LATENCY_SAMPLE_CAP = 200_000
 
 _DOW_LABELS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 
@@ -60,7 +56,7 @@ class ReportService:
     def __init__(self, db: AsyncSession):
         self.db = db
         self.analytics = AnalyticsService(db)
-        self._is_sqlite = "sqlite" in get_settings().database_url
+        self._dialect = dialect_name(db)
 
     async def build_report(
         self,
@@ -83,13 +79,21 @@ class ReportService:
         granularity = "day" if window_days > 2 else "hour"
         timeseries = await self.analytics.get_timeseries(project_id, start, end, granularity)
 
-        models = await self.analytics.get_model_stats(project_id, start, end, top_n)
+        # Shares and the Pareto denominator come from the whole window, not from
+        # the top_n rows below. The overview already summed it, so pass that
+        # figure down instead of re-running SUM(cost) over the same window.
+        window_cost = overview.total_cost
+        distinct_models = await self.analytics.get_distinct_model_count(project_id, start, end)
+
+        models = await self.analytics.get_model_stats(
+            project_id, start, end, top_n, window_cost=window_cost
+        )
         agents = await self.analytics.get_agent_stats(project_id, start, end, top_n)
 
         summary = self._summary(overview, prev_overview)
-        pareto = self._pareto(models)
-        agent_cost_share = self._agent_cost_share(agents, overview.total_cost)
-        latency = await self._latency(project_id, start, end, overview.avg_latency_ms)
+        pareto = self._pareto(models, window_cost, distinct_models)
+        agent_cost_share = self._agent_cost_share(agents, window_cost)
+        latency = await self._latency(project_id, start, end)
         efficiency = self._efficiency(overview, models)
         errors, top_errors = await self._errors(project_id, start, end)
         cadence = await self._cadence(project_id, start, end)
@@ -153,7 +157,15 @@ class ReportService:
             cost=self._delta(ov.total_cost, prev.total_cost),
             calls=self._delta(ov.total_calls, prev.total_calls),
             tokens=self._delta(ov.total_tokens, prev.total_tokens),
-            success_rate=self._delta(ov.success_rate, prev.success_rate),
+            # success_rate is undefined with no calls, and the overview reports
+            # it as 0.0 there. Diffing that against a populated window would
+            # claim a 100% collapse in reliability for what is really just an
+            # idle period, so hold it neutral unless both windows have calls.
+            success_rate=(
+                self._delta(ov.success_rate, prev.success_rate)
+                if ov.total_calls and prev.total_calls
+                else self._delta(ov.success_rate, ov.success_rate)
+            ),
             avg_latency_ms=self._delta(ov.avg_latency_ms, prev.avg_latency_ms),
             blended_cost_per_1k=round(blended_cost_per_1k, 6),
             in_out_ratio=round(in_out_ratio, 2),
@@ -162,22 +174,27 @@ class ReportService:
     # ── Cost concentration (Pareto) ───────────────────────────────────────
 
     @staticmethod
-    def _pareto(models: List[ModelStats]) -> ParetoInfo:
-        total = sum(m.total_cost for m in models)
-        if total <= 0 or not models:
-            return ParetoInfo(top_count=0, top_share=0.0, total_models=len(models))
+    def _pareto(models: List[ModelStats], total_cost: float, total_models: int) -> ParetoInfo:
+        # ``models`` is only the top_n slice, so both the denominator and the
+        # model count must come from the full window -- otherwise "3 of 10 models
+        # drive 80% of spend" is quoted for a project that actually runs 40, and
+        # the 80% is measured against a subtotal rather than real spend.
+        if total_cost <= 0 or not models:
+            return ParetoInfo(top_count=0, top_share=0.0, total_models=total_models)
         ordered = sorted(models, key=lambda m: m.total_cost, reverse=True)
         cumulative = 0.0
         top_count = 0
         for m in ordered:
             cumulative += m.total_cost
             top_count += 1
-            if cumulative / total >= 0.80:
+            if cumulative / total_cost >= 0.80:
                 break
+        # When the tail was truncated the listed models may never reach 80%; the
+        # reported share then honestly says how much they do cover.
         return ParetoInfo(
             top_count=top_count,
-            top_share=round(cumulative / total * 100.0, 1),
-            total_models=len(models),
+            top_share=round(cumulative / total_cost * 100.0, 1),
+            total_models=total_models,
         )
 
     @staticmethod
@@ -189,48 +206,76 @@ class ReportService:
     # ── Latency percentiles (only section needing raw rows) ───────────────
 
     async def _latency(
-        self, project_id: str, start: datetime, end: datetime, avg_latency: float
+        self, project_id: str, start: datetime, end: datetime
     ) -> LatencyPercentiles:
-        count_q = select(func.count(Event.id)).where(
+        """Exact p50/p95/p99 over every call in the window, computed in the
+        database rather than over a capped sample of rows."""
+        where_clause = (
             Event.project_id == project_id,
             Event.timestamp >= start,
             Event.timestamp <= end,
+            Event.latency_ms.isnot(None),
         )
-        total = int((await self.db.execute(count_q)).scalar() or 0)
+
+        is_postgres = self._dialect == "postgresql"
+
+        base_q = select(
+            func.count(Event.id).label("n"),
+            func.avg(Event.latency_ms).label("avg"),
+        ).where(*where_clause)
+
+        if is_postgres:
+            # One pass in the database: no rows cross the wire.
+            base_q = base_q.add_columns(
+                *[
+                    func.percentile_cont(p).within_group(Event.latency_ms.asc()).label(label)
+                    for p, label in ((0.50, "p50"), (0.95, "p95"), (0.99, "p99"))
+                ]
+            )
+
+        row = (await self.db.execute(base_q)).one()
+        total = int(row.n or 0)
         if total == 0:
             return LatencyPercentiles(p50=0.0, p95=0.0, p99=0.0, avg=0.0, sample_size=0)
 
-        approximate = False
-        rows_q = (
-            select(Event.latency_ms)
-            .where(
-                Event.project_id == project_id,
-                Event.timestamp >= start,
-                Event.timestamp <= end,
-            )
-            .order_by(Event.latency_ms)
-        )
-        if total > _LATENCY_SAMPLE_CAP:
-            approximate = True
-            rows_q = rows_q.limit(_LATENCY_SAMPLE_CAP)
+        avg = float(row.avg)
 
-        result = await self.db.execute(rows_q)
-        values = [int(r[0]) for r in result.all() if r[0] is not None]
-        if not values:
-            return LatencyPercentiles(p50=0.0, p95=0.0, p99=0.0, avg=avg_latency, sample_size=0)
-
-        def pct(p: float) -> float:
-            idx = min(len(values) - 1, int(p * (len(values) - 1)))
-            return float(values[idx])
+        if is_postgres:
+            p50, p95, p99 = (float(row.p50 or 0), float(row.p95 or 0), float(row.p99 or 0))
+        else:
+            # SQLite has no percentile function, so seek to the rank instead --
+            # still exact, and only the two straddling rows are fetched.
+            p50 = await self._percentile_by_offset(where_clause, 0.50, total)
+            p95 = await self._percentile_by_offset(where_clause, 0.95, total)
+            p99 = await self._percentile_by_offset(where_clause, 0.99, total)
 
         return LatencyPercentiles(
-            p50=round(pct(0.50), 2),
-            p95=round(pct(0.95), 2),
-            p99=round(pct(0.99), 2),
-            avg=round(sum(values) / len(values), 2),
-            sample_size=len(values),
-            approximate=approximate,
+            p50=round(p50, 2),
+            p95=round(p95, 2),
+            p99=round(p99, 2),
+            avg=round(avg, 2),
+            sample_size=total,
         )
+
+    async def _percentile_by_offset(self, where_clause, p: float, total: int) -> float:
+        """Linear-interpolated percentile via rank seek (matches percentile_cont)."""
+        rank = p * (total - 1)
+        lower = int(math.floor(rank))
+        fraction = rank - lower
+
+        q = (
+            select(Event.latency_ms)
+            .where(*where_clause)
+            .order_by(Event.latency_ms.asc())
+            .offset(lower)
+            .limit(2)
+        )
+        values = [int(v) for (v,) in (await self.db.execute(q)).all() if v is not None]
+        if not values:
+            return 0.0
+        if fraction == 0.0 or len(values) < 2:
+            return float(values[0])
+        return float(values[0]) + fraction * float(values[1] - values[0])
 
     # ── Token efficiency ──────────────────────────────────────────────────
 
@@ -315,12 +360,16 @@ class ReportService:
     # ── Usage cadence (busiest day / hour) ────────────────────────────────
 
     async def _cadence(self, project_id: str, start: datetime, end: datetime) -> UsageCadence:
-        if self._is_sqlite:
-            dow_expr = func.strftime("%w", Event.timestamp)
-            hour_expr = func.strftime("%H", Event.timestamp)
+        # Bucket in UTC to match the UTC window bounds: extract() on a
+        # ``timestamptz`` otherwise answers in the session TimeZone, which moves
+        # "busiest hour" (and, at the edges, "busiest day") by the server offset.
+        ts = utc_timestamp(self._dialect)
+        if self._dialect == "sqlite":
+            dow_expr = func.strftime("%w", ts)
+            hour_expr = func.strftime("%H", ts)
         else:
-            dow_expr = func.extract("dow", Event.timestamp)
-            hour_expr = func.extract("hour", Event.timestamp)
+            dow_expr = func.extract("dow", ts)
+            hour_expr = func.extract("hour", ts)
 
         base_where = (
             Event.project_id == project_id,

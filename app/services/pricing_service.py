@@ -2,14 +2,22 @@
 AgentCost Backend - Pricing Service
 """
 
+import re
+
 import httpx
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Any
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import case, func, or_, select
 
 from ..models.db_models import ModelPricing
 from ..config import get_settings
+
+# Separators model vendors use between name components ('gpt-4o-mini-2024-07-18',
+# 'anthropic/claude-3-5-sonnet', 'gemini-1.5-pro-002').
+_TOKEN_SEPARATOR = re.compile(r"[-_/.:@ ]")
+# Upper bound on the IN list a fuzzy lookup may build.
+_MAX_FUZZY_CANDIDATES = 60
 
 # Get configurable URLs from settings (with same defaults as fallback)
 _settings = get_settings()
@@ -55,11 +63,18 @@ PLATFORM_PROVIDERS = {
 
 
 class PricingService:
-    
-    def __init__(self, db: AsyncSession):
+
+    def __init__(self, db: AsyncSession, *, memoize_lookups: bool = False):
         self.db = db
         self._http_client: Optional[httpx.AsyncClient] = None
-    
+        # Opt-in, request-scoped memo of get_model_pricing. One optimization
+        # request resolves the same names over and over (each group's source
+        # model plus every alternative), and a miss costs up to three queries.
+        # Off by default: anything longer-lived would serve stale prices.
+        self._lookup_memo: Optional[Dict[str, Optional[Dict[str, Any]]]] = (
+            {} if memoize_lookups else None
+        )
+
     async def _get_client(self) -> httpx.AsyncClient:
         if self._http_client is None:
             self._http_client = httpx.AsyncClient(timeout=30.0)
@@ -70,43 +85,158 @@ class PricingService:
             await self._http_client.aclose()
             self._http_client = None
     
+    @staticmethod
+    def _price_payload(model: ModelPricing, match: str) -> Dict[str, Any]:
+        """Shape a ModelPricing row for callers, carrying how it was matched."""
+        return {
+            "input": model.input_price_per_1k,
+            "output": model.output_price_per_1k,
+            "provider": model.provider,
+            # "exact" | "fuzzy" — event_service records this as cost_source so
+            # an approximated price is distinguishable from a real one.
+            "match": match,
+            "matched_model": model.model_name,
+        }
+
     async def get_model_pricing(self, model_name: str) -> Optional[Dict[str, Any]]:
-        """Get pricing for a specific model."""
+        """Get pricing for a specific model.
+
+        Falls back to a *deterministic, most-specific* fuzzy match: event_service
+        overwrites the SDK's own cost with whatever this returns, so a match that
+        depends on planner order would bill a model at unrelated rates.
+        """
+        if self._lookup_memo is not None and model_name in self._lookup_memo:
+            return self._lookup_memo[model_name]
+
+        payload = await self._resolve_model_pricing(model_name)
+        if self._lookup_memo is not None:
+            self._lookup_memo[model_name] = payload
+        return payload
+
+    async def prefetch_pricing(self, model_names) -> None:
+        """Warm the memo for many models with a single exact-match IN query.
+
+        Names with no exact row are left out, so they still fall through to the
+        fuzzy path on their first real lookup. No-op without the memo enabled.
+        """
+        if self._lookup_memo is None:
+            return
+
+        wanted = {name for name in model_names if name and name not in self._lookup_memo}
+        if not wanted:
+            return
+
+        query = select(ModelPricing).where(
+            ModelPricing.model_name.in_(wanted),
+            ModelPricing.is_active == True,  # noqa: E712
+        )
+        rows = (await self.db.execute(query)).scalars().all()
+        self._lookup_memo.update(
+            {row.model_name: self._price_payload(row, "exact") for row in rows}
+        )
+
+    async def _resolve_model_pricing(self, model_name: str) -> Optional[Dict[str, Any]]:
         query = select(ModelPricing).where(
             ModelPricing.model_name == model_name,
             ModelPricing.is_active == True
         )
         result = await self.db.execute(query)
         model = result.scalar_one_or_none()
-        
+
         if model:
-            return {
-                "input": model.input_price_per_1k,
-                "output": model.output_price_per_1k,
-                "provider": model.provider,
-            }
-        
-        # Fuzzy match using SQL LIKE instead of loading all models into memory
-        model_lower = model_name.lower().replace("%", "").replace("_", "")
+            return self._price_payload(model, "exact")
+
+        model_lower = model_name.strip().lower()
         if not model_lower:
             return None
+
+        # 1. A known model whose name is contained in the requested one, e.g.
+        #    'gpt-4o-mini' for 'gpt-4o-mini-2024-07-18'. Longest wins — the same
+        #    "most specific family" rule the SDK uses (cost_calculator.py
+        #    _best_substring_match) — so 'gpt-4' can't outbid 'gpt-4o-mini'.
+        contained = await self._match_contained_in(model_lower)
+        if contained is not None:
+            # A row that differs only in case is still an exact hit, not a guess.
+            matched_lower = (contained.model_name or "").lower()
+            return self._price_payload(
+                contained, "exact" if matched_lower == model_lower else "fuzzy"
+            )
+
+        # 2. Otherwise a known model that *contains* the requested name, e.g.
+        #    'claude-3-5-haiku-20241022' for 'claude-3-5-haiku'. Shortest wins:
+        #    the least-decorated superset is the closest variant. Name is the
+        #    tie-break so identical-length candidates can't flip between calls.
         escaped = model_lower.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        fuzzy_query = select(ModelPricing).where(
-            ModelPricing.is_active == True,
-            ModelPricing.model_name.ilike(f"%{escaped}%")
-        ).limit(1)
-        result = await self.db.execute(fuzzy_query)
+        superset_query = (
+            select(ModelPricing)
+            .where(
+                ModelPricing.is_active == True,
+                ModelPricing.model_name.ilike(f"%{escaped}%", escape="\\"),
+            )
+            .order_by(
+                func.length(ModelPricing.model_name).asc(),
+                ModelPricing.model_name.asc(),
+            )
+            .limit(1)
+        )
+        result = await self.db.execute(superset_query)
         m = result.scalar_one_or_none()
-        
+
         if m:
-            return {
-                "input": m.input_price_per_1k,
-                "output": m.output_price_per_1k,
-                "provider": m.provider,
-            }
-        
+            return self._price_payload(m, "fuzzy")
+
         return None
-    
+
+    @staticmethod
+    def _candidate_names(model_name: str) -> List[str]:
+        """Every token-boundary slice of *model_name*, longest first.
+
+        'gpt-4o-mini-2024-07-18' yields 'gpt-4o-mini-2024-07', 'gpt-4o-mini',
+        '4o-mini', … so a family name stored in the pricing table can be found
+        with one indexed IN lookup. Slicing on separators (rather than on every
+        character) is what keeps 'gpt-4' from matching 'gpt-4o-mini': billing a
+        mini model at gpt-4 rates is a 200x error, not a rounding error.
+        """
+        lowered = model_name.lower()
+        boundaries = list(_TOKEN_SEPARATOR.finditer(lowered))
+        starts = [0] + [m.end() for m in boundaries]
+        ends = [m.start() for m in boundaries] + [len(lowered)]
+
+        slices = {
+            lowered[start:end]
+            for start in starts
+            for end in ends
+            if end > start
+        }
+        slices.discard("")
+
+        # Longest first: the most specific family is the closest price.
+        ordered = sorted(slices, key=lambda s: (-len(s), s))
+        return ordered[:_MAX_FUZZY_CANDIDATES]
+
+    async def _match_contained_in(self, model_name: str) -> Optional[ModelPricing]:
+        """Most specific active pricing row whose name is part of *model_name*."""
+        candidates = self._candidate_names(model_name)
+        if not candidates:
+            return None
+
+        # Both cases so a differently-cased row still matches, while the
+        # equality predicate keeps the model_name index usable.
+        lookup = sorted(set(candidates) | {c.upper() for c in candidates})
+
+        rows = (
+            await self.db.execute(
+                select(ModelPricing).where(
+                    ModelPricing.is_active == True,
+                    ModelPricing.model_name.in_(lookup),
+                )
+            )
+        ).scalars().all()
+        if not rows:
+            return None
+
+        return sorted(rows, key=lambda r: (-len(r.model_name or ""), r.model_name or ""))[0]
+
     async def get_all_pricing(self, provider: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
         """Get all active model pricing."""
         query = select(ModelPricing).where(ModelPricing.is_active == True)
@@ -692,34 +822,58 @@ class PricingService:
         max_results: int,
         requires_streaming: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Dynamic discovery of alternatives based on pricing (original logic)."""
+        """
+        Dynamic discovery of alternatives based on pricing.
+
+        Filtering and ordering happen in SQL. Doing them in Python meant
+        pulling every active model priced below the source into memory — after
+        a LiteLLM sync that is thousands of rows — sorting them all, and then
+        keeping a handful, once per distinct model in the request.
+
+        The SQL ordering reproduces the previous Python sort exactly: for a
+        fixed source model, savings percentage is strictly decreasing in the
+        alternative's combined price, so ordering by that price ascending is
+        the same ranking.
+        """
+        total_price = ModelPricing.input_price_per_1k + ModelPricing.output_price_per_1k
+
         query = select(ModelPricing).where(
             ModelPricing.is_active == True,
             ModelPricing.model_name != model,
-            (ModelPricing.input_price_per_1k + ModelPricing.output_price_per_1k) < source_total_cost
+            total_price < source_total_cost,
         )
-        
+
         if same_provider_only:
             query = query.where(ModelPricing.provider == source_provider)
-        
+        if requires_vision:
+            query = query.where(ModelPricing.supports_vision == True)
+        if requires_function_calling:
+            query = query.where(ModelPricing.supports_function_calling == True)
+        if requires_streaming:
+            query = query.where(ModelPricing.supports_streaming == True)
+
+        # A NULL max_tokens means "unknown", which the previous loop treated as
+        # acceptable — keep that.
+        total_tokens = (avg_input_tokens or 0) + (avg_output_tokens or 0)
+        if total_tokens > 0:
+            query = query.where(
+                or_(
+                    ModelPricing.max_tokens.is_(None),
+                    ModelPricing.max_tokens >= total_tokens,
+                )
+            )
+
+        query = query.order_by(
+            case((ModelPricing.provider == source_provider, 1), else_=0).desc(),
+            total_price.asc(),
+        ).limit(max_results)
+
         result = await self.db.execute(query)
         cheaper_models = result.scalars().all()
-        
+
         alternatives = []
-        
+
         for alt in cheaper_models:
-            if requires_vision and not alt.supports_vision:
-                continue
-            if requires_function_calling and not alt.supports_function_calling:
-                continue
-            if requires_streaming and not alt.supports_streaming:
-                continue
-            
-            if alt.max_tokens:
-                total_tokens = (avg_input_tokens or 0) + (avg_output_tokens or 0)
-                if total_tokens > 0 and alt.max_tokens < total_tokens:
-                    continue
-            
             input_savings = source_pricing["input"] - alt.input_price_per_1k
             output_savings = source_pricing["output"] - alt.output_price_per_1k
             total_savings = input_savings + output_savings
@@ -756,5 +910,5 @@ class PricingService:
                 "savings_accuracy": None,
             })
         
-        alternatives.sort(key=lambda x: (x["same_provider"], x["savings"]["percentage"]), reverse=True)
-        return alternatives[:max_results]
+        # Already ordered and capped by the query above.
+        return alternatives

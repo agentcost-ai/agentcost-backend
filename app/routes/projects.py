@@ -5,9 +5,8 @@ Endpoints for project management.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional
 
 from ..database import get_db
 from ..models.schemas import (
@@ -21,13 +20,10 @@ from ..models.db_models import Project
 from ..models.user_models import User
 from ..services.event_service import ProjectService
 from ..services.budget_service import BudgetService
-from ..services.auth_service import get_current_user
 from ..services.permission_service import PermissionService, Permission
 from ..utils.auth import (
     validate_api_key,
-    optional_api_key,
     get_required_user,
-    get_optional_user,
     validate_project_access_for_path_id,
 )
 
