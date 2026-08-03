@@ -334,3 +334,48 @@ async def test_admin_disabled_row_is_not_reactivated_by_the_sync(
     await test_session.commit()
     await test_session.refresh(row)
     assert row.is_active is False, "sync must not override a deliberate admin disable"
+
+
+@pytest.mark.asyncio
+async def test_stale_unit_error_row_is_retired_when_all_listings_are_rejected(
+    test_session: AsyncSession,
+):
+    """The production gap this guards: microsoft/Phi-4-mini-instruct was written
+    at $8/$35 by the old code; the new sync rejected its only (wandb) listing,
+    which also meant never touching -- and never retiring -- the stale bad row."""
+    test_session.add(ModelPricing(
+        model_name="only-bad", input_price_per_1k=8.0, output_price_per_1k=35.0,
+        provider="wandb", pricing_source="litellm", is_active=True,
+    ))
+    await test_session.commit()
+
+    payload = {
+        "wandb/only-bad": {"input_cost_per_token": 0.008,
+                           "output_cost_per_token": 0.035,
+                           "litellm_provider": "wandb"},
+    }
+    result = await _service(test_session, payload).sync_from_litellm()
+    await test_session.commit()
+
+    row = (await test_session.execute(
+        select(ModelPricing).where(ModelPricing.model_name == "only-bad")
+    )).scalar_one()
+    assert row.is_active is False
+    assert result["models_rejected"] == 1
+    assert result["models_deactivated"] == 1
+
+    # A second identical sync must not flap it back on.
+    await _service(test_session, payload).sync_from_litellm()
+    await test_session.commit()
+    await test_session.refresh(row)
+    assert row.is_active is False
+
+    # Upstream ships a sane price -> row returns with the corrected rate.
+    sane = {"wandb/only-bad": {"input_cost_per_token": 0.000001,
+                               "output_cost_per_token": 0.000002,
+                               "litellm_provider": "wandb"}}
+    await _service(test_session, sane).sync_from_litellm()
+    await test_session.commit()
+    await test_session.refresh(row)
+    assert row.is_active is True
+    assert row.input_price_per_1k == pytest.approx(0.001)

@@ -357,6 +357,12 @@ class PricingService:
                 (model_key, model_data, provider, input_price * 1000, output_price * 1000)
             )
 
+        # Names actually written this run. Distinct from grouped: a name whose
+        # every listing failed the sanity bound is in grouped but not here, and
+        # must be retired below like an absent one -- skipping it would leave a
+        # previously-written unit-error row live forever.
+        written_names = set()
+
         for model_name, candidates in grouped.items():
             chosen = self._select_representative(candidates)
             if chosen is None:
@@ -365,6 +371,7 @@ class PricingService:
                 rejected_count += 1
                 skipped_count += 1
                 continue
+            written_names.add(model_name)
 
             _key, model_data, provider, input_price_per_1k, output_price_per_1k = chosen
 
@@ -475,12 +482,15 @@ class PricingService:
         for name, row in existing_by_name.items():
             if row.pricing_source != "litellm":
                 continue
-            if name not in grouped and row.is_active:
+            if name not in written_names and row.is_active:
                 row.is_active = False
-                row.notes = AUTO_DEACTIVATED_MARKER + " absent from litellm feed"
+                row.notes = AUTO_DEACTIVATED_MARKER + (
+                    " no plausible listing upstream" if name in grouped
+                    else " absent from litellm feed"
+                )
                 row.updated_at = datetime.now(timezone.utc)
                 deactivated_count += 1
-            elif (name in grouped and not row.is_active
+            elif (name in written_names and not row.is_active
                   and (row.notes or "").startswith(AUTO_DEACTIVATED_MARKER)):
                 row.is_active = True
                 row.notes = None
