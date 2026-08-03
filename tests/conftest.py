@@ -38,6 +38,37 @@ def event_loop():
     loop.close()
 
 
+@pytest.fixture(autouse=True)
+def no_outbound_email(monkeypatch, request):
+    """Never let the suite reach api.resend.com.
+
+    resend.api_key is bound at import time from .env -- the production key on a
+    dev machine -- and email_service._send swallows failures, so tests touching
+    email paths made live sends without anything turning red. Autouse so no
+    test can forget; assert on captures via the ``sent_emails`` fixture.
+    """
+    import resend
+
+    sent = _SENT_EMAILS
+    sent.clear()
+
+    def _capture(params, *args, **kwargs):
+        sent.append(params)
+        return {"id": f"test-{len(sent)}"}
+
+    monkeypatch.setattr(resend.Emails, "send", staticmethod(_capture))
+    yield sent
+
+
+_SENT_EMAILS: list = []
+
+
+@pytest.fixture
+def sent_emails(no_outbound_email):
+    """The emails this test asked to send, in order. See no_outbound_email."""
+    return no_outbound_email
+
+
 @pytest.fixture(scope="function")
 async def test_engine():
     """Create test database engine"""

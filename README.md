@@ -190,8 +190,8 @@ ADMIN_PASSWORD=
 # Debug mode
 DEBUG=false
 
-# Auto-sync pricing on startup
-AUTO_SYNC_PRICING_ON_STARTUP=true
+# Hours between background pricing syncs (0 disables them)
+PRICING_SYNC_INTERVAL_HOURS=24
 ```
 
 ## Database

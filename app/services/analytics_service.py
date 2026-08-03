@@ -72,8 +72,9 @@ class AnalyticsService:
         
         avg_cost_per_call = total_cost / total_calls if total_calls > 0 else 0.0
         avg_tokens_per_call = total_tokens / total_calls if total_calls > 0 else 0.0
-        # No calls means no successes to rate, so 0% rather than a vacuous 100%.
-        success_rate = (success_count / total_calls * 100) if total_calls > 0 else 0.0
+        # Empty window -> 100: nothing failed. Reporting 0 made the dashboard
+        # and PDF render an idle project as "100% error rate" in red.
+        success_rate = (success_count / total_calls * 100) if total_calls > 0 else 100.0
         
         return AnalyticsOverview(
             total_cost=round(total_cost, 6),
@@ -135,7 +136,8 @@ class AnalyticsService:
             total_cost = float(row.total_cost) if row.total_cost is not None else 0.0
             avg_latency = float(row.avg_latency) if row.avg_latency is not None else 0.0
             success_count = int(row.success_count) if row.success_count is not None else 0
-            success_rate = (success_count / total_calls * 100) if total_calls > 0 else 0.0
+            # Same empty-window convention as get_overview.
+            success_rate = (success_count / total_calls * 100) if total_calls > 0 else 100.0
 
             agents.append(AgentStats(
                 agent_name=row.agent_name,

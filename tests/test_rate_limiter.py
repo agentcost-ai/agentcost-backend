@@ -145,3 +145,42 @@ def test_anonymous_requests_are_keyed_by_ip():
 )
 def test_bucket_classification(path, bucket):
     assert RateLimiter.get_bucket(path) == bucket
+
+
+def test_rotating_the_auth_header_cannot_mint_fresh_buckets():
+    """The bypass this guards: the key used to be derived from the Authorization
+    header alone, so `Bearer <random>` per request gave every request its own
+    counter and the limiter never fired -- leaving /v1/auth/login unthrottled
+    against credential stuffing."""
+    limiter, _ = _limiter(requests_per_window=3)
+
+    allowed = []
+    for i in range(6):
+        request = _request("/v1/auth/login", auth=f"Bearer forged-{i}", ip="203.0.113.9")
+        # Mirrors the middleware: every bucket must admit the request.
+        verdicts = [limiter.is_allowed(k)[0] for k in limiter.get_keys_from_request(request)]
+        allowed.append(all(verdicts))
+
+    assert allowed == [True, True, True, False, False, False]
+
+
+def test_ip_bucket_is_always_enforced_even_with_a_token():
+    limiter, _ = _limiter()
+
+    keys = limiter.get_keys_from_request(
+        _request("/v1/analytics/overview", auth="Bearer sk_test_12345", ip="203.0.113.7")
+    )
+    assert "api:ip:203.0.113.7" in keys, "the IP bucket must always be counted"
+    assert any(k.startswith("api:api_key:") for k in keys), "token still narrows further"
+
+
+def test_two_tokens_from_one_ip_still_get_their_own_narrower_budget():
+    """The IP cap is shared, but one busy SDK key must not exhaust another's."""
+    limiter, _ = _limiter(requests_per_window=100)
+
+    a = _request("/v1/events/batch", auth="Bearer sk_aaa", ip="198.51.100.4")
+    b = _request("/v1/events/batch", auth="Bearer sk_bbb", ip="198.51.100.4")
+    token_key_a = [k for k in limiter.get_keys_from_request(a) if "api_key" in k][0]
+    token_key_b = [k for k in limiter.get_keys_from_request(b) if "api_key" in k][0]
+
+    assert token_key_a != token_key_b

@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import case, func, or_, select
 
+from ..common import MAX_PRICE_PER_1K
 from ..models.db_models import ModelPricing
 from ..config import get_settings
 
@@ -60,6 +61,10 @@ PLATFORM_PROVIDERS = {
     "azure", "azure_ai", "bedrock", "bedrock_converse",
     "vertex_ai", "sagemaker",
 }
+
+# Rows deactivated automatically carry this notes prefix; only such rows are
+# auto-reactivated when the model reappears upstream.
+AUTO_DEACTIVATED_MARKER = "auto-deactivated:"
 
 
 class PricingService:
@@ -313,21 +318,27 @@ class PricingService:
             for row in (await self.db.execute(select(ModelPricing))).scalars()
         }
 
+        # Group source keys by canonical name, then pick one representative per
+        # name before writing anything (see _select_representative). Writing
+        # colliding keys in sequence meant "last key in the upstream JSON wins",
+        # which let wandb's per-million unit error price shared models at up to
+        # 540,000x their real rate -- and event_service bills off these rows.
+        grouped: Dict[str, List[tuple]] = {}
+        collision_count = 0
+        rejected_count = 0
+
         for model_key, model_data in pricing_data.items():
             if not isinstance(model_data, dict):
                 skipped_count += 1
                 continue
-            
+
             input_price = model_data.get("input_cost_per_token", 0)
             output_price = model_data.get("output_cost_per_token", 0)
-            
+
             if input_price == 0 and output_price == 0:
                 skipped_count += 1
                 continue
-            
-            input_price_per_1k = input_price * 1000
-            output_price_per_1k = output_price * 1000
-            
+
             # Use litellm_provider from the data if available, otherwise parse from key
             litellm_provider = model_data.get("litellm_provider")
             if litellm_provider:
@@ -339,12 +350,30 @@ class PricingService:
                 model_name = self._canonicalize_model_name(model_key, litellm_provider)
             else:
                 model_name, provider = self._parse_litellm_model_key(model_key)
-            
+
+            if model_name in grouped:
+                collision_count += 1
+            grouped.setdefault(model_name, []).append(
+                (model_key, model_data, provider, input_price * 1000, output_price * 1000)
+            )
+
+        for model_name, candidates in grouped.items():
+            chosen = self._select_representative(candidates)
+            if chosen is None:
+                # Every listing is implausible; better no row (event_service
+                # falls back to the SDK's own cost) than a unit-error price.
+                rejected_count += 1
+                skipped_count += 1
+                continue
+
+            _key, model_data, provider, input_price_per_1k, output_price_per_1k = chosen
+
             max_tokens = model_data.get("max_tokens") or model_data.get("max_output_tokens")
+            max_input_tokens = model_data.get("max_input_tokens")
             supports_vision = model_data.get("supports_vision", False)
             supports_function_calling = model_data.get("supports_function_calling", False)
             supports_streaming = model_data.get("supports_streaming", True)
-            
+
             existing = existing_by_name.get(model_name)
 
             if existing:
@@ -393,6 +422,7 @@ class PricingService:
                     ("output_price_per_1k", output_price_per_1k),
                     ("provider", provider),
                     ("max_tokens", max_tokens),
+                    ("max_input_tokens", max_input_tokens),
                     ("supports_vision", supports_vision),
                     ("supports_function_calling", supports_function_calling),
                     ("supports_streaming", supports_streaming),
@@ -427,6 +457,7 @@ class PricingService:
                     output_price_per_1k=output_price_per_1k,
                     provider=provider,
                     max_tokens=max_tokens,
+                    max_input_tokens=max_input_tokens,
                     supports_vision=supports_vision,
                     supports_function_calling=supports_function_calling,
                     supports_streaming=supports_streaming,
@@ -434,11 +465,26 @@ class PricingService:
                     source_updated_at=datetime.now(timezone.utc),
                 )
                 self.db.add(new_pricing)
-                # Register it: LiteLLM can canonicalize two keys onto one
-                # model_name, and model_name is UNIQUE. Without this the second
-                # occurrence would insert a duplicate and fail the constraint.
-                existing_by_name[model_name] = new_pricing
                 created_count += 1
+
+        # Retire litellm-sourced rows that vanished from the feed; a model
+        # nobody prices anymore must stop being recommended as an alternative.
+        # Only rows this mechanism (or the repair script) deactivated are ever
+        # reactivated on return -- an admin's deliberate disable is not fought.
+        deactivated_count = 0
+        for name, row in existing_by_name.items():
+            if row.pricing_source != "litellm":
+                continue
+            if name not in grouped and row.is_active:
+                row.is_active = False
+                row.notes = AUTO_DEACTIVATED_MARKER + " absent from litellm feed"
+                row.updated_at = datetime.now(timezone.utc)
+                deactivated_count += 1
+            elif (name in grouped and not row.is_active
+                  and (row.notes or "").startswith(AUTO_DEACTIVATED_MARKER)):
+                row.is_active = True
+                row.notes = None
+                row.updated_at = datetime.now(timezone.utc)
 
         await self.db.flush()
 
@@ -449,6 +495,13 @@ class PricingService:
             "models_updated": updated_count,
             "models_unchanged": unchanged_count,
             "models_skipped": skipped_count,
+            # Multi-host listings that collapsed onto an already-claimed name;
+            # non-zero is normal.
+            "models_deduplicated": collision_count,
+            # Names where every listing failed the price sanity bound.
+            "models_rejected": rejected_count,
+            # Active litellm rows retired because the feed no longer lists them.
+            "models_deactivated": deactivated_count,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         
@@ -537,6 +590,27 @@ class PricingService:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
     
+    @staticmethod
+    def _select_representative(candidates: List[tuple]) -> Optional[tuple]:
+        """Pick one ``(source_key, model_data, provider, input_1k, output_1k)``
+        listing to represent a canonical model name, or None if none is usable.
+
+        Listings above MAX_PRICE_PER_1K are discarded as upstream unit errors
+        (no real model costs $10/1k; the admin routes enforce the same bound).
+        Of the rest, take the median by price: order-independent, so upstream
+        reshuffles cannot rewrite prices, and immune to a single broken listing.
+        A whole tuple is chosen so input/output stay one host's coherent pair.
+        """
+        sane = [
+            c for c in candidates
+            if c[3] <= MAX_PRICE_PER_1K and c[4] <= MAX_PRICE_PER_1K
+        ]
+        if not sane:
+            return None
+        # The source key breaks ties identically on every run.
+        sane.sort(key=lambda c: (c[3], c[4], c[0]))
+        return sane[len(sane) // 2]
+
     def _canonicalize_model_name(self, model_key: str, litellm_provider: str) -> str:
         """Canonicalize model name by stripping provider prefix for primary providers.
         
@@ -877,14 +951,22 @@ class PricingService:
         if requires_streaming:
             query = query.where(ModelPricing.supports_streaming == True)
 
-        # A NULL max_tokens means "unknown", which the previous loop treated as
-        # acceptable — keep that.
-        total_tokens = (avg_input_tokens or 0) + (avg_output_tokens or 0)
-        if total_tokens > 0:
+        # Each side of the workload against its own cap; NULL means "unknown"
+        # and is accepted. max_tokens is the OUTPUT cap, so comparing it to
+        # input+output excluded models whose context easily fits the workload
+        # (an 8k-output model was hidden from a 20k-input workload it handles).
+        if avg_input_tokens:
+            query = query.where(
+                or_(
+                    ModelPricing.max_input_tokens.is_(None),
+                    ModelPricing.max_input_tokens >= avg_input_tokens,
+                )
+            )
+        if avg_output_tokens:
             query = query.where(
                 or_(
                     ModelPricing.max_tokens.is_(None),
-                    ModelPricing.max_tokens >= total_tokens,
+                    ModelPricing.max_tokens >= avg_output_tokens,
                 )
             )
 

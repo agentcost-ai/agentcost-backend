@@ -119,10 +119,17 @@ async def _last_synced_at(db: AsyncSession) -> Optional[datetime]:
     week stale when it had in fact just been checked. Callers asking "is this
     current?" mean the sync, not the last price movement.
     """
-    return (await db.execute(
+    synced_at = (await db.execute(
         select(func.max(PricingSyncLog.created_at))
         .where(PricingSyncLog.status == "ok")
     )).scalar()
+    if synced_at is not None:
+        return synced_at
+
+    # A populated catalogue with no sync logged (hand-seeded, or pre-dating
+    # pricing_sync_log) is stale-dated, not unknown -- returning None here made
+    # the public /docs/models page render "Never" over thousands of models.
+    return (await db.execute(select(func.max(ModelPricing.updated_at)))).scalar()
 
 
 @router.get("/sync/status")
@@ -199,10 +206,9 @@ async def get_all_pricing(
             }
         # last_updated = when the catalogue was last refreshed; per-model
         # updated_at above still reports when that model's price last moved.
-        synced_at = await _last_synced_at(db) or max(
-            (m.updated_at for m in db_pricing if m.updated_at),
-            default=datetime.now(timezone.utc),
-        )
+        # _last_synced_at already falls back to the catalogue high-water mark,
+        # so only a completely empty history reaches the default here.
+        synced_at = await _last_synced_at(db) or datetime.now(timezone.utc)
         return {
             "pricing": pricing,
             "source": "database",
@@ -222,42 +228,26 @@ async def get_all_pricing(
 
 @router.get("/{model_name}")
 async def get_model_pricing(model_name: str, db: AsyncSession = Depends(get_db)):
-    """Get pricing for a specific model."""
-    query = select(ModelPricing).where(
-        ModelPricing.model_name == model_name,
-        ModelPricing.is_active == True
-    )
-    result = await db.execute(query)
-    model = result.scalar_one_or_none()
-    
-    if model:
+    """Get pricing for a specific model.
+
+    Answers with the same resolver event ingestion bills with (exact then
+    deterministic fuzzy against the full catalogue). This route used to run its
+    own substring match over the small DEFAULT_PRICING dict and could quote a
+    different price than the one events were actually costed at.
+    """
+    service = PricingService(db)
+    pricing = await service.get_model_pricing(model_name)
+
+    if pricing:
         return {
             "model": model_name,
-            "input": model.input_price_per_1k,
-            "output": model.output_price_per_1k,
-            "provider": model.provider,
-            "source": "database",
+            "matched_to": pricing["matched_model"],
+            "input": pricing["input"],
+            "output": pricing["output"],
+            "provider": pricing["provider"],
+            "source": "database" if pricing["match"] == "exact" else "database-fuzzy",
         }
-    
-    model_lower = model_name.lower()
-    
-    # Sort by length descending to match most specific model first (e.g. "gpt-4-turbo" before "gpt-4")
-    sorted_pricing = sorted(DEFAULT_PRICING.items(), key=lambda x: len(x[0]), reverse=True)
-    
-    for name, pricing in sorted_pricing:
-        # Check if known model name is contained in requested model name
-        # e.g. "gpt-4" in "gpt-4-0613" -> Match
-        # But "gpt-4-turbo" NOT in "gpt-4" -> No match (correct)
-        if name in model_lower:
-            return {
-                "model": model_name,
-                "matched_to": name,
-                "input": pricing['input'],
-                "output": pricing['output'],
-                "provider": pricing['provider'],
-                "source": "defaults",
-            }
-    
+
     return {
         "model": model_name,
         "input": 0.0,
@@ -363,10 +353,22 @@ async def sync_from_litellm(
     
     By default, also regenerates model alternatives to reflect new pricing.
     """
+    from ..services.cron import claim_pricing_sync
+
+    # Claim like every other entry point, and log the run -- without the log
+    # entry, deployments that only ever sync manually reported last_updated
+    # as null forever.
+    log_entry = await claim_pricing_sync(db)
+    if log_entry is None:
+        raise HTTPException(
+            status_code=409,
+            detail="A pricing sync is already running. Try again in a few minutes.",
+        )
+
     pricing_service = PricingService(db)
     try:
         result = await pricing_service.sync_from_litellm(track_changes=track_changes)
-        
+
         # Auto-regenerate alternatives if requested
         if auto_regenerate_alternatives and result.get("status") == "ok":
             from ..services.alternative_learning_service import AlternativeLearningService
@@ -375,8 +377,26 @@ async def sync_from_litellm(
             result["alternatives_regenerated"] = True
             result["alternatives_created"] = alt_result.get("alternatives_created", 0)
             result["alternatives_updated"] = alt_result.get("alternatives_updated", 0)
-        
+
+        log_entry.status = "error" if result.get("status") == "error" else "ok"
+        log_entry.models_created = result.get("models_created", 0)
+        log_entry.models_updated = result.get("models_updated", 0)
+        log_entry.models_skipped = result.get("models_skipped", 0)
+        log_entry.error_message = result.get("error")
+        await db.commit()
         return result
+    except HTTPException:
+        raise
+    except Exception as exc:
+        await db.rollback()
+        from sqlalchemy import update as sa_update
+        await db.execute(
+            sa_update(PricingSyncLog)
+            .where(PricingSyncLog.id == log_entry.id)
+            .values(status="error", error_message=str(exc)[:500])
+        )
+        await db.commit()
+        raise
     finally:
         await pricing_service.close()
 

@@ -104,6 +104,28 @@ async def _last_sync(db: AsyncSession, source: str):
     return row, (datetime.now(timezone.utc) - created).total_seconds() / 3600
 
 
+async def claim_pricing_sync(
+    db: AsyncSession, source: str = "litellm", admin_id=None
+) -> "PricingSyncLog | None":
+    """Insert and commit a 'running' claim, or return None if a live one exists.
+
+    Shared by cron and the admin sync routes so a manual sync and the scheduled
+    one cannot run the same multi-minute job concurrently. A stale claim (older
+    than _SYNC_STALE_AFTER_HOURS) is treated as a dead process and superseded.
+    """
+    last, elapsed = await _last_sync(db, source)
+    if (
+        last is not None
+        and last.status == "running"
+        and elapsed < _SYNC_STALE_AFTER_HOURS
+    ):
+        return None
+    entry = PricingSyncLog(source=source, status="running", admin_id=admin_id)
+    db.add(entry)
+    await db.commit()
+    return entry
+
+
 async def sync_pricing_if_due(db: AsyncSession) -> bool:
     """Refresh model pricing when the configured interval has elapsed.
 
@@ -133,13 +155,11 @@ async def sync_pricing_if_due(db: AsyncSession) -> bool:
     # Imported here so a pricing-service import error cannot stop the purge job.
     from .pricing_service import PricingService
 
-    # Claim the slot BEFORE the work and commit it, so a concurrent caller sees
-    # the run in progress. sync_from_litellm takes minutes; recording only on
-    # completion left that whole window open and every entry point started its
-    # own overlapping full sync.
-    entry = PricingSyncLog(source="litellm", status="running")
-    db.add(entry)
-    await db.commit()
+    # Claim the slot BEFORE the work (see claim_pricing_sync); an admin-run
+    # sync may have claimed it between our _last_sync read and now.
+    entry = await claim_pricing_sync(db)
+    if entry is None:
+        return False
 
     logger.info(
         "Pricing sync due (last run %s); syncing from LiteLLM",

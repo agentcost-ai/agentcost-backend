@@ -157,10 +157,8 @@ class ReportService:
             cost=self._delta(ov.total_cost, prev.total_cost),
             calls=self._delta(ov.total_calls, prev.total_calls),
             tokens=self._delta(ov.total_tokens, prev.total_tokens),
-            # success_rate is undefined with no calls, and the overview reports
-            # it as 0.0 there. Diffing that against a populated window would
-            # claim a 100% collapse in reliability for what is really just an
-            # idle period, so hold it neutral unless both windows have calls.
+            # success_rate is vacuous with no calls (overview reports 100 there),
+            # so hold the delta neutral unless both windows actually have calls.
             success_rate=(
                 self._delta(ov.success_rate, prev.success_rate)
                 if ov.total_calls and prev.total_calls

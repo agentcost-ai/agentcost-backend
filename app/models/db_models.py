@@ -59,7 +59,8 @@ class Event(Base):
     project_id = Column(String(36), ForeignKey("projects.id"), nullable=False)
     
     agent_name = Column(String(255), nullable=False, default="default")
-    model = Column(String(100), nullable=False)
+    # 255: Bedrock inference-profile ARNs exceed the old 100-char cap.
+    model = Column(String(255), nullable=False)
     
     input_tokens = Column(Integer, nullable=False)
     output_tokens = Column(Integer, nullable=False)
@@ -120,7 +121,7 @@ class DailyAggregate(Base):
     date = Column(DateTime(timezone=True), nullable=False)
     
     agent_name = Column(String(255), nullable=True)
-    model = Column(String(100), nullable=True)
+    model = Column(String(255), nullable=True)
     
     total_calls = Column(Integer, nullable=False, default=0)
     total_tokens = Column(Integer, nullable=False, default=0)
@@ -168,7 +169,11 @@ class ModelPricing(Base):
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
     # Additional fields for capability tracking
+    # max_tokens is the OUTPUT cap (LiteLLM's max_tokens/max_output_tokens);
+    # max_input_tokens is the context/input cap. They differ by 10-100x on most
+    # models, so filtering one against the other hides valid alternatives.
     max_tokens = Column(Integer, nullable=True)
+    max_input_tokens = Column(Integer, nullable=True)
     supports_vision = Column(Boolean, default=False)
     supports_function_calling = Column(Boolean, default=False)
     supports_streaming = Column(Boolean, default=True)

@@ -22,7 +22,8 @@ class EventCreate(BaseModel):
     """Schema for a single event in batch"""
 
     agent_name: str = Field(default="default", max_length=255)
-    model: str = Field(..., max_length=100)
+    # 255, matching events.model: Bedrock inference-profile ARNs exceed 100.
+    model: str = Field(..., max_length=255)
     input_tokens: int = Field(..., ge=0)
     output_tokens: int = Field(..., ge=0)
     # Optional: the server derives total_tokens and re-prices cost itself, so

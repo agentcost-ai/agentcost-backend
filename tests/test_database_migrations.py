@@ -78,3 +78,75 @@ async def test_column_migrations_are_idempotent(test_engine):
         names = [row[1] for row in columns]
         assert names.count("cost_source") == 1
         assert names.count("input_hash") == 1
+
+
+async def test_first_boot_creates_then_second_boot_skips_the_work():
+    """The bootstrap cost 87% of a cold start by re-introspecting every table on
+    every boot only to find nothing to do."""
+    import app.database as db_module
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    original = db_module.engine
+    db_module.engine = engine
+    try:
+        first = await db_module.create_tables()
+        assert "created" in first, first
+
+        second = await db_module.create_tables()
+        assert second == "schema already matches models; no changes needed"
+
+        # The tables really are there -- the skip is a cache hit, not a no-op boot.
+        async with engine.begin() as conn:
+            tables = await conn.run_sync(lambda c: set(inspect(c).get_table_names()))
+        assert "users" in tables and "model_pricing" in tables
+    finally:
+        db_module.engine = original
+        await engine.dispose()
+
+
+async def test_changing_the_models_invalidates_the_bootstrap_cache():
+    """The cache must never let a schema change go unapplied."""
+    import app.database as db_module
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    original = db_module.engine
+    original_desired = db_module._DESIRED_COLUMNS
+    db_module.engine = engine
+    try:
+        await db_module.create_tables()
+        assert await db_module.create_tables() == (
+            "schema already matches models; no changes needed"
+        )
+
+        before = db_module._schema_fingerprint()
+        db_module._DESIRED_COLUMNS = {
+            **original_desired,
+            "users": {**original_desired["users"],
+                      "brand_new_column": {"type": "VARCHAR(10)"}},
+        }
+        assert db_module._schema_fingerprint() != before, "fingerprint must move"
+
+        summary = await db_module.create_tables()
+        assert "column(s) added" in summary
+
+        async with engine.begin() as conn:
+            cols = await conn.run_sync(
+                lambda c: {col["name"] for col in inspect(c).get_columns("users")}
+            )
+        assert "brand_new_column" in cols
+    finally:
+        db_module._DESIRED_COLUMNS = original_desired
+        db_module.engine = original
+        await engine.dispose()

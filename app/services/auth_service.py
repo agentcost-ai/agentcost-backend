@@ -67,11 +67,16 @@ def create_access_token(
     user_id: str,
     email: str,
     expires_delta: Optional[timedelta] = None,
-    reactivated: bool = False
+    reactivated: bool = False,
+    session_id: Optional[str] = None,
 ) -> Tuple[str, datetime]:
     """
     Create a JWT access token.
-    
+
+    session_id binds the token to a UserSession so revoking the session kills
+    the token immediately (see get_current_user). Without it the token stays
+    valid until exp regardless of revocation.
+
     Returns:
         Tuple of (token, expiry_datetime)
     """
@@ -79,7 +84,7 @@ def create_access_token(
         expire = datetime.now(timezone.utc) + expires_delta
     else:
         expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    
+
     payload = {
         "sub": user_id,
         "email": email,
@@ -87,9 +92,11 @@ def create_access_token(
         "exp": expire,
         "iat": datetime.now(timezone.utc),
     }
-    
+
     if reactivated:
         payload["grace_period_reactivated"] = True
+    if session_id:
+        payload["sid"] = session_id
     
     token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
     return token, expire
@@ -946,17 +953,11 @@ class AuthService:
         """
         Generate tokens and create session for user login.
         """
-        access_token, access_expires = create_access_token(
-            user_id=user.id,
-            email=user.email,
-            reactivated=getattr(user, 'grace_period_reactivated', False)
-        )
-        
         refresh_token, refresh_expires = create_refresh_token(
             user_id=user.id,
             remember_me=remember_me
         )
-        
+
         session = UserSession(
             user_id=user.id,
             token_hash=hash_token(refresh_token),
@@ -964,12 +965,20 @@ class AuthService:
             ip_address=ip_address,
             expires_at=refresh_expires,
         )
-        
+
         self.db.add(session)
-        
+
         user.last_login_at = datetime.now(timezone.utc)
-        
+
+        # Flush first so the session has an id to bind the access token to.
         await self.db.flush()
+
+        access_token, access_expires = create_access_token(
+            user_id=user.id,
+            email=user.email,
+            reactivated=getattr(user, 'grace_period_reactivated', False),
+            session_id=session.id,
+        )
         
         expires_in = int((access_expires - datetime.now(timezone.utc)).total_seconds())
         
@@ -1230,9 +1239,10 @@ class AuthService:
         
         access_token, access_expires = create_access_token(
             user_id=user.id,
-            email=user.email
+            email=user.email,
+            session_id=session.id,
         )
-        
+
         await self.db.flush()
         
         expires_in = int((access_expires - datetime.now(timezone.utc)).total_seconds())
@@ -1264,17 +1274,27 @@ async def get_current_user(
     Used as a dependency in protected routes.
     """
     payload = decode_token(token)
-    
+
     if not payload or payload.get("type") != "access":
         return None
-    
+
     user_id = payload.get("sub")
-    
+
     if not user_id:
         return None
-    
+
+    # A token bound to a session dies with it. Tokens without a sid claim
+    # (issued before binding existed) are accepted until they expire.
+    session_id = payload.get("sid")
+    if session_id:
+        revoked = (await db.execute(
+            select(UserSession.is_revoked).where(UserSession.id == session_id)
+        )).scalar_one_or_none()
+        if revoked is None or revoked:
+            return None
+
     result = await db.execute(
         select(User).where(User.id == user_id, User.is_active == True)
     )
-    
+
     return result.scalar_one_or_none()

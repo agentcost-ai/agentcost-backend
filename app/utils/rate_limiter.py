@@ -182,20 +182,29 @@ class RateLimiter:
         """
         Extract rate limit key from request.
 
-        Priority:
-        1. API key from Authorization header
-        2. Client IP address
+        Kept for callers that want a single identifying key; the middleware uses
+        get_keys_from_request so a rotating token cannot escape the IP budget.
+        """
+        return self.get_keys_from_request(request)[0]
+
+    def get_keys_from_request(self, request: Request) -> list[str]:
+        """Every bucket this request must fit in; the IP bucket always among them.
+
+        The IP must be counted unconditionally: any key derived from the
+        Authorization header -- alone or combined with the IP -- is minted fresh
+        by a caller rotating `Bearer <random>` per request, which is how login
+        throttling was bypassed entirely. The token bucket is kept as a second,
+        narrower limit so one busy SDK key cannot exhaust a shared NAT's budget.
         """
         bucket = self.get_bucket(request.url.path)
+        keys = [f"{bucket}:ip:{_client_ip(request)}"]
 
-        # Try to get API key
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             key_hash = hashlib.sha256(auth_header.encode()).hexdigest()
-            return f"{bucket}:api_key:{key_hash}"
+            keys.append(f"{bucket}:api_key:{key_hash}")
 
-        # Fall back to IP
-        return f"{bucket}:ip:{_client_ip(request)}"
+        return keys
 
 
 class RedisRateLimiter:
@@ -355,9 +364,15 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if not request.url.path.startswith("/v1/"):
             return await call_next(request)
 
-        # Check rate limit
-        key = rate_limiter.get_key_from_request(request)
-        is_allowed, remaining, reset_in = await check_rate_limit(key)
+        # Every bucket must admit the request; headers report the tightest
+        # remaining count and the longest reset.
+        is_allowed, remaining, reset_in = True, None, 0
+        for key in rate_limiter.get_keys_from_request(request):
+            allowed, key_remaining, key_reset = await check_rate_limit(key)
+            is_allowed = is_allowed and allowed
+            remaining = key_remaining if remaining is None else min(remaining, key_remaining)
+            reset_in = max(reset_in, key_reset)
+        remaining = remaining or 0
 
         # Add rate limit headers to all responses
         headers = {

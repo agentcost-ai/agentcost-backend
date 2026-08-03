@@ -236,3 +236,44 @@ async def test_model_pricing_lookups_are_memoized(test_session: AsyncSession, te
     assert "gpt-4" in pricing._lookup_memo
     # A plain PricingService keeps looking every model up.
     assert PricingService(test_session)._lookup_memo is None
+
+
+@pytest.mark.asyncio
+async def test_output_cap_is_not_filtered_against_input_size(
+    test_session: AsyncSession,
+):
+    """max_tokens is the output cap; max_input_tokens the context cap. Filtering
+    max_tokens against input+output hid an 8k-output model from a 20k-input
+    workload its 128k context handles fine."""
+    from app.services.pricing_service import PricingService
+
+    test_session.add_all([
+        ModelPricing(model_name="expensive-src", input_price_per_1k=0.01,
+                     output_price_per_1k=0.03, provider="openai", is_active=True),
+        # Fits: large context, small output cap.
+        ModelPricing(model_name="cheap-small-output", input_price_per_1k=0.001,
+                     output_price_per_1k=0.002, provider="openai", is_active=True,
+                     max_tokens=8192, max_input_tokens=128_000),
+        # Does not fit: context smaller than the workload's input.
+        ModelPricing(model_name="cheap-small-context", input_price_per_1k=0.001,
+                     output_price_per_1k=0.002, provider="openai", is_active=True,
+                     max_tokens=8192, max_input_tokens=4_000),
+    ])
+    await test_session.commit()
+
+    service = PricingService(test_session)
+    alts = await service._discover_dynamically(
+        model="expensive-src",
+        source_pricing={"input": 0.01, "output": 0.03},
+        source_total_cost=0.04,
+        source_provider="openai",
+        avg_input_tokens=20_000,
+        avg_output_tokens=1_000,
+        requires_vision=False,
+        requires_function_calling=False,
+        same_provider_only=False,
+        max_results=10,
+    )
+    names = {a["model"] for a in alts}
+    assert "cheap-small-output" in names
+    assert "cheap-small-context" not in names

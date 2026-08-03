@@ -266,35 +266,6 @@ class BaselineService:
         await self.compute_baselines(project_id, days)
         return True
     
-    async def get_baseline(
-        self,
-        project_id: str,
-        agent_name: Optional[str] = None,
-        model: Optional[str] = None,
-    ) -> Optional[ProjectBaseline]:
-        """
-        Get baseline for a specific agent/model combination.
-        
-        If both agent_name and model are provided, returns the specific baseline.
-        If only one is provided, or neither, may return multiple matches - 
-        in that case returns the most recently calculated one.
-        """
-        query = select(ProjectBaseline).where(
-            ProjectBaseline.project_id == project_id
-        )
-        
-        if agent_name:
-            query = query.where(ProjectBaseline.agent_name == agent_name)
-        if model:
-            query = query.where(ProjectBaseline.model == model)
-        
-        # Order by most recently calculated to get the freshest baseline
-        query = query.order_by(ProjectBaseline.last_calculated_at.desc())
-        
-        result = await self.db.execute(query)
-        # Use .first() to handle cases where multiple baselines match
-        return result.scalars().first()
-    
     async def detect_anomalies(
         self,
         project_id: str,

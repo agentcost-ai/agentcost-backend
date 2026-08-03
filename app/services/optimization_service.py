@@ -73,7 +73,7 @@ class OptimizationService:
             result = await self.db.execute(query)
             cache: Dict[Tuple[Any, Any], ProjectBaseline] = {}
             for baseline in result.scalars().all():
-                # First row wins: same "freshest baseline" rule get_baseline uses.
+                # First row wins: freshest-baseline-first rule.
                 cache.setdefault((baseline.agent_name, baseline.model), baseline)
             self._baseline_cache = cache
             self._baseline_cache_project = project_id

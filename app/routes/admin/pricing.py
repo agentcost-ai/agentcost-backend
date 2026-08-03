@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, update
 
 from ...database import get_db
 from ...models.user_models import User
@@ -202,6 +202,17 @@ async def sync_litellm_pricing(
     admin: User = Depends(require_superuser),
 ):
     """Trigger manual LiteLLM pricing sync with full audit trail."""
+    from ...services.cron import claim_pricing_sync
+
+    # Same claim the cron uses: a sync takes minutes, and running two
+    # concurrently doubles the write load for no benefit.
+    log_entry = await claim_pricing_sync(db, admin_id=admin.id)
+    if log_entry is None:
+        raise HTTPException(
+            status_code=409,
+            detail="A pricing sync is already running. Try again in a few minutes.",
+        )
+
     pricing_service = PricingService(db)
     start_time = time.monotonic()
     try:
@@ -209,20 +220,15 @@ async def sync_litellm_pricing(
         duration_ms = int((time.monotonic() - start_time) * 1000)
 
         changes = result.get("changes", {})
-        log_entry = PricingSyncLog(
-            admin_id=admin.id,
-            source="litellm",
-            status=result.get("status", "ok"),
-            models_created=result.get("models_created", 0),
-            models_updated=result.get("models_updated", 0),
-            models_skipped=result.get("models_skipped", 0),
-            new_models=changes.get("new_models") or None,
-            price_changes=changes.get("price_changes") or None,
-            capability_changes=changes.get("capability_changes") or None,
-            error_message=result.get("error"),
-            duration_ms=duration_ms,
-        )
-        db.add(log_entry)
+        log_entry.status = result.get("status", "ok")
+        log_entry.models_created = result.get("models_created", 0)
+        log_entry.models_updated = result.get("models_updated", 0)
+        log_entry.models_skipped = result.get("models_skipped", 0)
+        log_entry.new_models = changes.get("new_models") or None
+        log_entry.price_changes = changes.get("price_changes") or None
+        log_entry.capability_changes = changes.get("capability_changes") or None
+        log_entry.error_message = result.get("error")
+        log_entry.duration_ms = duration_ms
 
         await log_admin_action(
             db,
@@ -245,17 +251,17 @@ async def sync_litellm_pricing(
         return result
     except Exception as exc:
         duration_ms = int((time.monotonic() - start_time) * 1000)
-        log_entry = PricingSyncLog(
-            admin_id=admin.id,
-            source="litellm",
-            status="error",
-            error_message=str(exc),
-            duration_ms=duration_ms,
-        )
         # Discard the partially-applied price changes before recording the
         # failure; committing here would persist them while logging an error.
+        # The claim row was committed before the work, so it survives the
+        # rollback and is closed with a targeted UPDATE.
         await db.rollback()
-        db.add(log_entry)
+        await db.execute(
+            update(PricingSyncLog)
+            .where(PricingSyncLog.id == log_entry.id)
+            .values(status="error", error_message=str(exc)[:500],
+                    duration_ms=duration_ms)
+        )
         await db.commit()
         raise
     finally:

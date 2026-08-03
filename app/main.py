@@ -32,6 +32,7 @@ from .utils.request_size import RequestSizeLimitMiddleware
 import logging
 import os
 import sys
+import time
 
 settings = get_settings()
 
@@ -50,8 +51,13 @@ async def lifespan(app: FastAPI):
     """Application lifespan events"""
     # Startup
     logger.info("Starting AgentCost Backend...")
-    await create_tables()
-    logger.info("Database tables created")
+    # Log what the bootstrap actually did and how long it took -- the old
+    # unconditional "Database tables created" was wrong on every boot but the first.
+    schema_started = time.monotonic()
+    schema_summary = await create_tables()
+    logger.info(
+        "Database schema: %s (%.2fs)", schema_summary, time.monotonic() - schema_started
+    )
     
     # Create upload directory if missing
     upload_dir = Path(settings.upload_dir).resolve()
@@ -99,7 +105,7 @@ async def lifespan(app: FastAPI):
                             await db.commit()
                             logger.info("Existing user %s promoted to superuser", admin_email)
                         else:
-                            logger.info("Superuser %s already exists", admin_email)
+                            logger.debug("Superuser %s already exists", admin_email)
                     else:
                         admin_name = os.getenv("ADMIN_NAME", "Admin").strip()
                         user = User(

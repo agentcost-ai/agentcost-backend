@@ -65,10 +65,8 @@ class Settings(BaseSettings):
     max_batch_size: int = 100  # max events per batch request
     
     # Pricing sync settings
-    # Also attempt a sync shortly after startup, in the background. Still
-    # subject to pricing_sync_interval_hours, so a host that restarts often
-    # does not re-sync every wake.
-    auto_sync_pricing_on_startup: bool = False
+    # (auto_sync_pricing_on_startup was removed: cron's first tick already
+    # syncs at boot, so the flag only produced a second overlapping sync.)
     # Minimum hours between background syncs, measured from the last successful
     # run recorded in pricing_sync_log. 0 disables background syncing entirely;
     # POST /v1/pricing/sync/litellm always works regardless.

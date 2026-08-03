@@ -48,10 +48,19 @@ async def test_failed_and_running_syncs_do_not_count(test_session: AsyncSession)
 
 
 @pytest.mark.asyncio
-async def test_none_when_never_synced(test_session: AsyncSession):
-    """Callers fall back to max(updated_at) rather than showing nothing."""
+async def test_populated_catalogue_with_no_sync_log_reports_its_own_high_water_mark(
+    test_session: AsyncSession,
+):
+    """A populated DB with no sync logged is stale-dated, not unknown -- None
+    here rendered as "Never" on the public /docs/models page."""
     test_session.add(ModelPricing(model_name="m", input_price_per_1k=0.01,
                                   output_price_per_1k=0.02, provider="openai"))
     await test_session.commit()
 
+    assert await _last_synced_at(test_session) is not None
+
+
+@pytest.mark.asyncio
+async def test_none_only_when_there_is_nothing_at_all(test_session: AsyncSession):
+    """Empty catalogue and empty history genuinely has no date to report."""
     assert await _last_synced_at(test_session) is None

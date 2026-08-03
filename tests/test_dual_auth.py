@@ -454,3 +454,25 @@ async def test_disabled_project_returns_403_for_jwt(db_session, http_client):
     )
     assert response.status_code == 403
     assert "disabled" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_revoking_a_session_kills_its_access_token(
+    test_session: AsyncSession, test_user
+):
+    """The gap this closes: revoking a session only killed the refresh token,
+    so the access token kept working until exp."""
+    from app.services.auth_service import AuthService, get_current_user
+
+    auth = AuthService(test_session)
+    tokens = await auth.login_user(test_user)
+    await test_session.commit()
+
+    assert (await get_current_user(test_session, tokens.access_token)) is not None
+
+    sessions = await auth.get_active_sessions(test_user.id)
+    assert sessions, "login must have created a session"
+    await auth.revoke_session(test_user.id, sessions[0].id)
+    await test_session.commit()
+
+    assert (await get_current_user(test_session, tokens.access_token)) is None

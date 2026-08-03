@@ -84,16 +84,17 @@ async def test_model_cost_share_totals_100_when_nothing_is_truncated(
     assert sum(m.cost_share for m in models) == pytest.approx(100.0, abs=0.1)
 
 
-async def test_empty_window_reports_zero_success_rate(
+async def test_empty_window_reports_full_success_rate(
     test_session: AsyncSession, test_project
 ):
-    """No calls means no successes -- 100% made empty windows look healthy."""
+    """Empty window -> 100: nothing failed. 0 rendered idle projects as a red
+    "100% error rate" on the dashboard and in the customer PDF."""
     analytics = AnalyticsService(test_session)
     end = datetime.now(timezone.utc)
     overview = await analytics.get_overview(test_project.id, end - timedelta(days=1), end)
 
     assert overview.total_calls == 0
-    assert overview.success_rate == 0.0
+    assert overview.success_rate == 100.0
 
 
 # ── Pareto ────────────────────────────────────────────────────────────────
