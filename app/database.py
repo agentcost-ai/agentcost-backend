@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import MetaData, text, inspect
+from sqlalchemy import DateTime, MetaData, bindparam, text, inspect
 from typing import AsyncGenerator, List
 
 from .config import get_settings
@@ -169,10 +169,8 @@ async def create_tables() -> str:
         await conn.execute(text("DELETE FROM schema_bootstrap_state"))
         await conn.execute(
             text("INSERT INTO schema_bootstrap_state (fingerprint, applied_at) "
-                 "VALUES (:fp, :at)"),
-            # ISO string: binding a datetime to this raw-DDL column trips
-            # SQLite's deprecated adapter. Nothing reads it back.
-            {"fp": fingerprint, "at": datetime.now(timezone.utc).isoformat()},
+                 "VALUES (:fp, :at)").bindparams(bindparam("at", type_=DateTime())),
+            {"fp": fingerprint, "at": datetime.now(timezone.utc).replace(tzinfo=None)},
         )
 
         created = sorted(after - before)
