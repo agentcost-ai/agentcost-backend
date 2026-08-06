@@ -11,6 +11,7 @@ from .feedback import router as feedback_router
 from .attachments import router as attachments_router
 from .notifications import router as notifications_router
 from .currency import router as currency_router
+from .integrations import router as integrations_router
 
 __all__ = [
     "events_router",
@@ -22,4 +23,5 @@ __all__ = [
     "attachments_router",
     "notifications_router",
     "currency_router",
+    "integrations_router",
 ]

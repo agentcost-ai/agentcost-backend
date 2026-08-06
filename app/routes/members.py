@@ -141,6 +141,14 @@ async def invite_member(
     If the user has an account, they'll receive an invitation to accept.
     If the user doesn't have an account, they'll receive an email with instructions to register.
     """
+    # Inviting sends email to third parties on the inviter's behalf — the one
+    # action that stays gated on a verified address (login itself is not).
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Verify your email address to invite teammates. Check your inbox for the verification link, or resend it from the banner above.",
+        )
+
     member_service = MemberService(db)
     
     result, error, is_new_user = await member_service.invite_member(

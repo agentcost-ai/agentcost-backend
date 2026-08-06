@@ -11,6 +11,7 @@ from typing import Optional, Annotated
 from ..database import get_db
 from ..models.auth_schemas import (
     UserRegister, UserLogin, UserResponse, TokenResponse, RegisterResponse,
+    DefaultProjectInfo,
     PasswordChangeRequest, PasswordResetRequest, PasswordResetConfirm,
     EmailVerificationRequest, ResendVerificationRequest,
     SessionListResponse, SessionInfo, ProfileUpdate,
@@ -19,6 +20,7 @@ from ..models.auth_schemas import (
 )
 from ..services.auth_service import AuthService, verify_google_id_token, exchange_github_code
 from ..services.email_service import send_verification_email, send_password_reset_email, send_welcome_email
+from ..services.event_service import ProjectService
 from ..services.member_service import MemberService
 from ..models.user_models import User
 from ..models.db_models import UserMilestone
@@ -91,8 +93,12 @@ async def register(
     - **accept_privacy**: Must be true - explicit consent to Privacy Policy
     - **terms_version**: Version of Terms being accepted (e.g., "1.0")
     - **privacy_version**: Version of Privacy Policy being accepted (e.g., "1.0")
-    
+
     Legal consent is recorded with timestamp, IP address, and user agent for audit compliance.
+
+    The user is logged in immediately: the response includes the same token payload
+    as /login, plus a default project (API key shown ONCE) and whether the
+    verification email was actually sent.
     """
     # Extract client info for consent audit trail
     device_info, ip_address = get_client_info(request)
@@ -114,21 +120,47 @@ async def register(
         plaintext_token = getattr(user, '_plaintext_verification_token', None)
         email_sent = False
         if plaintext_token:
-            await send_verification_email(user.email, plaintext_token, user.name)
-            # Track when verification email was sent
-            user.email_verification_sent_at = datetime.now(timezone.utc)
-            await db.flush()
-            email_sent = True
-        
-        if email_sent:
-            message = "Registration successful. Please check your email to verify your account."
-        else:
-            message = "Account successfully linked! You can now sign in with your email and password."
-        
+            email_sent = await send_verification_email(user.email, plaintext_token, user.name)
+            if email_sent:
+                # Track when verification email was sent
+                user.email_verification_sent_at = datetime.now(timezone.utc)
+                await db.flush()
+
+        # Auto-create a default project so the user lands with a working API key.
+        # Registration must still succeed if this fails.
+        default_project = None
+        try:
+            project_service = ProjectService(db)
+            project, plaintext_api_key = await project_service.create(
+                name="My First Project",
+                owner_id=user.id,
+            )
+            default_project = DefaultProjectInfo(
+                id=project.id,
+                name=project.name,
+                api_key=plaintext_api_key,  # Show ONCE, then never again
+            )
+        except Exception as e:
+            print(f"[AUTH] Default project creation failed for {user.email}: {e}")
+
+        message = "Registration successful. Please check your email to verify your account."
         if pending_count > 0:
             message += f" You have {pending_count} pending project invitation(s) waiting for you."
-        
+
+        # Log the user in immediately (soft email verification): same token
+        # payload as /login, so the frontend can go straight to the dashboard.
+        tokens = await auth_service.login_user(
+            user=user,
+            remember_me=False,
+            device_info=device_info,
+            ip_address=ip_address,
+        )
+
         return RegisterResponse(
+            access_token=tokens.access_token,
+            refresh_token=tokens.refresh_token,
+            token_type=tokens.token_type,
+            expires_in=tokens.expires_in,
             user=UserResponse(
                 id=user.id,
                 email=user.email,
@@ -142,7 +174,9 @@ async def register(
                 user_number=user.user_number,
                 milestone_badge=user.milestone_badge,
             ),
-            message=message
+            message=message,
+            verification_email_sent=email_sent,
+            default_project=default_project,
         )
     
     except ValueError as e:
@@ -233,13 +267,33 @@ async def google_auth(
             except Exception:
                 pass  # Don't fail auth if welcome email fails
     
+    # First sign-in gets a default project, same as email registration.
+    # Auth must still succeed if this fails.
+    default_project = None
+    if is_new_user:
+        try:
+            project_service = ProjectService(db)
+            project, plaintext_api_key = await project_service.create(
+                name="My First Project",
+                owner_id=user.id,
+            )
+            default_project = DefaultProjectInfo(
+                id=project.id,
+                name=project.name,
+                api_key=plaintext_api_key,  # Show ONCE, then never again
+            )
+        except Exception as e:
+            print(f"[AUTH] Default project creation failed for {user.email}: {e}")
+
     # Generate tokens and create session (same as regular login)
-    return await auth_service.login_user(
+    token_response = await auth_service.login_user(
         user=user,
         remember_me=True,  # Google users get extended session by default
         device_info=device_info,
         ip_address=ip_address,
     )
+    token_response.default_project = default_project
+    return token_response
 
 
 # ============== GitHub OAuth ==============
@@ -323,13 +377,33 @@ async def github_auth(
             except Exception:
                 pass  # Don't fail auth if welcome email fails
 
+    # First sign-in gets a default project, same as email registration.
+    # Auth must still succeed if this fails.
+    default_project = None
+    if is_new_user:
+        try:
+            project_service = ProjectService(db)
+            project, plaintext_api_key = await project_service.create(
+                name="My First Project",
+                owner_id=user.id,
+            )
+            default_project = DefaultProjectInfo(
+                id=project.id,
+                name=project.name,
+                api_key=plaintext_api_key,  # Show ONCE, then never again
+            )
+        except Exception as e:
+            print(f"[AUTH] Default project creation failed for {user.email}: {e}")
+
     # Generate tokens and create session (same as regular login)
-    return await auth_service.login_user(
+    token_response = await auth_service.login_user(
         user=user,
         remember_me=True,  # OAuth users get extended session by default
         device_info=device_info,
         ip_address=ip_address,
     )
+    token_response.default_project = default_project
+    return token_response
 
 
 # ============== Policy Consent ==============
@@ -422,13 +496,9 @@ async def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    # Block login if email is not verified
-    if not user.email_verified:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Please verify your email address before logging in. Check your inbox for the verification link.",
-        )
-    
+    # Soft email verification: unverified users may log in and use the product.
+    # The response includes user.email_verified so the frontend can show a
+    # "verify your email" banner.
     device_info, ip_address = get_client_info(request)
     
     return await auth_service.login_user(

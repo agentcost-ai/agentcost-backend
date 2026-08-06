@@ -95,11 +95,25 @@ class UserResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class DefaultProjectInfo(BaseModel):
+    """Default project created at registration (api_key shown ONCE, never again)"""
+
+    id: str
+    name: str
+    api_key: str
+
+
 class RegisterResponse(BaseModel):
-    """Registration response"""
-    
+    """Registration response - includes tokens so the user is logged in immediately"""
+
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int  # seconds
     user: UserResponse
     message: str = "Registration successful. Please check your email to verify your account."
+    verification_email_sent: bool = False
+    default_project: Optional[DefaultProjectInfo] = None
 
 
 class GoogleAuthRequest(BaseModel):
@@ -134,12 +148,14 @@ class UserLogin(BaseModel):
 
 class TokenResponse(BaseModel):
     """JWT token response"""
-    
+
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
     expires_in: int  # seconds
     user: UserResponse
+    # Set only on first OAuth sign-in (api_key shown ONCE, never again)
+    default_project: Optional[DefaultProjectInfo] = None
 
 
 class RefreshTokenRequest(BaseModel):

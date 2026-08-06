@@ -49,7 +49,15 @@ def _utc_connect_args(url: str) -> dict:
     """
     if "postgresql" not in url:
         return {}
-    return {"server_settings": {"timezone": "UTC"}}
+    connect_args: dict = {"server_settings": {"timezone": "UTC"}}
+    if "asyncpg" in url:
+        # asyncpg caches prepared-statement plans per connection; the startup
+        # schema migrations (and any pooler reusing backends) invalidate those
+        # plans, which surfaced in prod as InvalidCachedStatementError 500s on
+        # /v1/analytics/models. Disabling the cache trades a tiny per-query
+        # cost for correctness. SQLite (aiosqlite) never reaches this branch.
+        connect_args["statement_cache_size"] = 0
+    return connect_args
 
 
 # Create async engine
