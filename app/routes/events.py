@@ -126,6 +126,7 @@ async def ingest_events_batch(
 
     try:
         count = await event_service.persist_events_batch(prepared)
+        await event_service.persist_outcomes(project.id, request.outcomes)
     except Exception as exc:
         raise _ingest_failed("ingesting", exc) from exc
 

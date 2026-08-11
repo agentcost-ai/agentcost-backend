@@ -135,6 +135,7 @@ def _schema_fingerprint() -> str:
         parts.append(f"{table_name}({','.join(cols)})")
     parts.append(repr(_DESIRED_COLUMNS))
     parts.append(repr(_WIDEN_COLUMNS))
+    parts.append(repr(_DESIRED_INDEXES))
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
@@ -171,6 +172,9 @@ async def create_tables() -> str:
         await conn.run_sync(Base.metadata.create_all)
         after = set(await conn.run_sync(lambda c: set(inspect(c).get_table_names())))
         added_columns = await _apply_column_migrations(conn)
+        # After the columns exist: an index over a column added in this pass
+        # would otherwise fail.
+        added_indexes = await _apply_index_migrations(conn)
 
         # Only the current fingerprint is kept: an older row would let a
         # rollback to a previous build skip the migrations it still needs.
@@ -182,12 +186,13 @@ async def create_tables() -> str:
         )
 
         created = sorted(after - before)
-        if not created and not added_columns:
+        if not created and not added_columns and not added_indexes:
             return "schema verified; no changes needed"
         return (
             f"schema updated: {len(created)} table(s) created"
             f"{' (' + ', '.join(created) + ')' if created else ''}, "
-            f"{added_columns} column(s) added"
+            f"{added_columns} column(s) added, "
+            f"{added_indexes} index(es) ensured"
         )
 
 
@@ -214,6 +219,15 @@ _DESIRED_COLUMNS = {
         "cost_source": {"type": "VARCHAR(50)"},
         # SHA256 of normalized input for caching pattern detection
         "input_hash": {"type": "VARCHAR(64)"},
+        # Trace structure; all nullable.
+        "trace_id":       {"type": "VARCHAR(32)"},
+        "span_id":        {"type": "VARCHAR(32)"},
+        "parent_span_id": {"type": "VARCHAR(32)"},
+        "workflow":       {"type": "VARCHAR(255)"},
+        "step_name":      {"type": "VARCHAR(255)"},
+        "step_index":     {"type": "INTEGER"},
+        "depth":          {"type": "INTEGER"},
+        "tool_name":      {"type": "VARCHAR(255)"},
     },
     "users": {
         "admin_notes":    {"type": "TEXT"},
@@ -251,6 +265,33 @@ _WIDEN_COLUMNS = [
     ("events", "model", 255),
     ("daily_aggregates", "model", 255),
 ]
+
+
+# Indexes for tables that already shipped: create_all() only builds indexes for
+# tables it creates. Module level so _schema_fingerprint hashes it.
+_DESIRED_INDEXES = [
+    ("idx_events_trace", "events", "project_id, trace_id"),
+    ("idx_events_workflow", "events", "project_id, workflow, timestamp"),
+]
+
+
+async def _apply_index_migrations(conn) -> int:
+    """Create any declared index the live schema is missing."""
+    applied = 0
+    for name, table, columns in _DESIRED_INDEXES:
+        def _has_table(sync_conn, table_name=table):
+            return inspect(sync_conn).has_table(table_name)
+
+        if not await conn.run_sync(_has_table):
+            continue
+        stmt = f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})"
+        try:
+            await conn.execute(text(stmt))
+            applied += 1
+        except Exception as exc:
+            # Performance, never correctness: must not stop the app booting.
+            logger.warning("Index migration skipped (%s): %s", name, exc)
+    return applied
 
 
 async def _apply_column_migrations(conn):

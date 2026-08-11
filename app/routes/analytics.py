@@ -4,7 +4,7 @@ AgentCost Backend - Analytics API Routes
 Endpoints for analytics queries.
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Literal
@@ -21,6 +21,7 @@ from ..models.schemas import (
 from ..models.db_models import Project
 from ..services.analytics_service import AnalyticsService
 from ..services.report_service import ReportService
+from ..services.trace_service import TraceService
 from ..utils.auth import validate_project_access
 
 router = APIRouter(prefix="/v1/analytics", tags=["Analytics"])
@@ -202,3 +203,138 @@ async def get_full_analytics(
     """
     analytics = AnalyticsService(db)
     return await analytics.get_full_analytics(project.id, days)
+
+
+# --- Trace analytics ------------------------------------------------------
+# Cost attributed to the shape of a run rather than to the model that served
+# it. Every endpoint below reads only events carrying trace structure; runs
+# recorded by an SDK predating workflow()/step() are absent by design rather
+# than silently blended into these totals.
+
+
+@router.get("/workflows")
+async def get_workflow_stats(
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """Cost per workflow, including the average cost of a single run."""
+    start_time, end_time = parse_time_range(range)
+    return await TraceService(db).get_workflow_stats(
+        project.id, start_time, end_time, limit=limit
+    )
+
+
+@router.get("/workflows/steps")
+async def get_step_stats(
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    workflow: Optional[str] = Query(None, description="Restrict to one workflow"),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """Cost per step. calls_per_run above 1 indicates retries or a loop."""
+    start_time, end_time = parse_time_range(range)
+    return await TraceService(db).get_step_stats(
+        project.id, start_time, end_time, workflow=workflow, limit=limit
+    )
+
+
+@router.get("/workflows/tools")
+async def get_tool_stats(
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """LLM spend incurred underneath each named tool."""
+    start_time, end_time = parse_time_range(range)
+    return await TraceService(db).get_tool_stats(
+        project.id, start_time, end_time, limit=limit
+    )
+
+
+@router.get("/workflows/repeated-work")
+async def get_repeated_work(
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    limit: int = Query(25, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """Identical calls repeated within a single run, and what they cost."""
+    start_time, end_time = parse_time_range(range)
+    return await TraceService(db).detect_repeated_work(
+        project.id, start_time, end_time, limit=limit
+    )
+
+
+@router.get("/workflows/outcomes")
+async def get_outcome_stats(
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    limit: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """Cost per completed outcome. Requires track_costs.outcome() in the run."""
+    start_time, end_time = parse_time_range(range)
+    return await TraceService(db).get_outcome_stats(
+        project.id, start_time, end_time, limit=limit
+    )
+
+
+@router.get("/workflows/distribution")
+async def get_run_cost_distribution(
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    workflow: Optional[str] = Query(None, description="Defaults to the highest-spend workflow"),
+    buckets: int = Query(24, ge=6, le=60),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """
+    Distribution of cost per run, with percentiles and the tail's share of spend.
+
+    Computed over every run in the window rather than a top-N slice, because a
+    distribution drawn from the most expensive runs is not a distribution.
+    """
+    start_time, end_time = parse_time_range(range)
+    service = TraceService(db)
+
+    target = workflow
+    if target is None:
+        ranked = await service.get_workflow_stats(project.id, start_time, end_time, limit=1)
+        if not ranked:
+            return None
+        target = ranked[0]["workflow"]
+
+    return await service.get_run_cost_distribution(
+        project.id, start_time, end_time, workflow=target, buckets=buckets
+    )
+
+
+@router.get("/traces")
+async def list_traces(
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    workflow: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """Individual runs, most expensive first."""
+    start_time, end_time = parse_time_range(range)
+    return await TraceService(db).list_traces(
+        project.id, start_time, end_time, workflow=workflow, limit=limit
+    )
+
+
+@router.get("/traces/{trace_id}")
+async def get_trace_detail(
+    trace_id: str,
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """Every span of one run, ordered as it executed."""
+    detail = await TraceService(db).get_trace_detail(project.id, trace_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Trace not found")
+    return detail

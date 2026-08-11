@@ -6,7 +6,7 @@ SQLAlchemy models for all database tables.
 
 from sqlalchemy import (
     Column, String, Integer, Float, Boolean, DateTime, Text, ForeignKey,
-    Index, JSON
+    Index, JSON, UniqueConstraint
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -81,16 +81,30 @@ class Event(Base):
     
     # Hash of normalized input for caching pattern detection
     input_hash = Column(String(64), nullable=True)
-    
+
+    # Trace structure. All nullable -- untraced calls have no place in a tree,
+    # so queries must treat NULL as "untraced" rather than as a member.
+    trace_id = Column(String(32), nullable=True)
+    span_id = Column(String(32), nullable=True)
+    parent_span_id = Column(String(32), nullable=True)
+    workflow = Column(String(255), nullable=True)
+    step_name = Column(String(255), nullable=True)
+    # Orders steps that ran concurrently, which timestamps cannot.
+    step_index = Column(Integer, nullable=True)
+    depth = Column(Integer, nullable=True)
+    tool_name = Column(String(255), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    
+
     project = relationship("Project", back_populates="events")
-    
+
     __table_args__ = (
         Index("idx_events_project_time", "project_id", "timestamp"),
         Index("idx_events_agent", "project_id", "agent_name", "timestamp"),
         Index("idx_events_model", "project_id", "model", "timestamp"),
         Index("idx_events_input_hash", "project_id", "input_hash"),
+        Index("idx_events_trace", "project_id", "trace_id"),
+        Index("idx_events_workflow", "project_id", "workflow", "timestamp"),
     )
     
     def __repr__(self):
@@ -431,6 +445,33 @@ class ProjectBaseline(Base):
     
     def __repr__(self):
         return f"<ProjectBaseline {self.project_id} - {self.agent_name}/{self.model}>"
+
+
+class TraceOutcome(Base):
+    """How one run ended. Separate from events: an outcome belongs to the run,
+    not to any single call in it."""
+
+    __tablename__ = "trace_outcomes"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id"), nullable=False)
+    trace_id = Column(String(32), nullable=False)
+
+    workflow = Column(String(255), nullable=True)
+    success = Column(Boolean, nullable=False, default=True)
+    label = Column(String(255), nullable=True)
+
+    recorded_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        # One outcome per run; a re-send updates rather than duplicates.
+        UniqueConstraint("project_id", "trace_id", name="uq_outcome_project_trace"),
+        Index("idx_outcomes_project_workflow", "project_id", "workflow", "recorded_at"),
+    )
+
+    def __repr__(self):
+        return f"<TraceOutcome {self.trace_id} success={self.success}>"
 
 
 class InputPatternCache(Base):

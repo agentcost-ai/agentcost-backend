@@ -37,7 +37,20 @@ class EventCreate(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # Hash of normalized input text for caching pattern detection
     input_hash: Optional[str] = Field(None, max_length=64)
-    
+
+    # Trace structure, emitted by SDKs that use workflow()/step()/tool().
+    # Every field is optional: older SDKs, and calls made outside a workflow,
+    # send none of them and must keep ingesting exactly as before.
+    trace_id: Optional[str] = Field(None, max_length=32)
+    span_id: Optional[str] = Field(None, max_length=32)
+    parent_span_id: Optional[str] = Field(None, max_length=32)
+    workflow: Optional[str] = Field(None, max_length=255)
+    step_name: Optional[str] = Field(None, max_length=255)
+    step_index: Optional[int] = Field(None, ge=0)
+    depth: Optional[int] = Field(None, ge=0)
+    tool_name: Optional[str] = Field(None, max_length=255)
+
+
     @field_validator('timestamp')
     @classmethod
     def validate_timestamp(cls, v):
@@ -73,6 +86,15 @@ def _describe(exc: ValidationError) -> str:
     )
 
 
+class OutcomeCreate(BaseModel):
+    """How one run ended, as reported by the SDK."""
+
+    trace_id: str = Field(..., min_length=1, max_length=32)
+    workflow: Optional[str] = Field(None, max_length=255)
+    success: bool = True
+    label: Optional[str] = Field(None, max_length=255)
+
+
 class EventBatchRequest(BaseModel):
     """Request body for batch event ingestion
 
@@ -83,6 +105,10 @@ class EventBatchRequest(BaseModel):
 
     project_id: str = Field(..., min_length=1)
     events: List[EventCreate] = Field(..., max_length=_MAX_EVENTS_PER_BATCH)
+    # Absent from older SDKs, and from any batch whose runs declared none.
+    outcomes: List[OutcomeCreate] = Field(
+        default_factory=list, max_length=_MAX_EVENTS_PER_BATCH
+    )
 
     # Outputs of the partitioning validator, not things a client sends: private
     # so they stay out of the generated request-body schema. ``events`` may end
@@ -177,7 +203,13 @@ class EventResponse(BaseModel):
     success: bool
     error: Optional[str] = None
     extra_data: Optional[Dict[str, Any]] = None
-    
+
+    # Null for calls made outside a workflow().
+    trace_id: Optional[str] = None
+    workflow: Optional[str] = None
+    step_name: Optional[str] = None
+    tool_name: Optional[str] = None
+
     @field_validator('timestamp', mode='before')
     @classmethod
     def serialize_timestamp(cls, v):

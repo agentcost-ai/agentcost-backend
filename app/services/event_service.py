@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from ..models.db_models import Event, Project
-from ..models.schemas import EventCreate
+from ..models.schemas import EventCreate, OutcomeCreate
 
 # Prices are quoted per 1000 tokens, so a single call's cost runs to small
 # fractions of a cent. Round at the precision PricingService prices with.
@@ -127,6 +127,14 @@ class EventService:
                     error=event_data.error,
                     extra_data=event_data.metadata,
                     input_hash=event_data.input_hash,
+                    trace_id=event_data.trace_id,
+                    span_id=event_data.span_id,
+                    parent_span_id=event_data.parent_span_id,
+                    workflow=event_data.workflow,
+                    step_name=event_data.step_name,
+                    step_index=event_data.step_index,
+                    depth=event_data.depth,
+                    tool_name=event_data.tool_name,
                 )
                 db_events.append(db_event)
 
@@ -161,6 +169,57 @@ class EventService:
         await self.db.flush()  # Let get_db handle the final commit
 
         return len(prepared.rows)
+
+    async def persist_outcomes(
+        self, project_id: str, outcomes: List[OutcomeCreate]
+    ) -> int:
+        """
+        Upsert run outcomes. Caller's transaction owns the commit.
+
+        A run can report an outcome more than once -- an optimistic success
+        followed by a late failure -- so the last write for a trace wins.
+        """
+        from ..models.db_models import TraceOutcome
+
+        if not outcomes:
+            return 0
+
+        # Last record per trace, so one batch cannot insert two rows for the
+        # same run and trip the unique constraint.
+        latest = {o.trace_id: o for o in outcomes}
+
+        existing_rows = await self.db.execute(
+            select(TraceOutcome).where(
+                TraceOutcome.project_id == project_id,
+                TraceOutcome.trace_id.in_(list(latest)),
+            )
+        )
+        existing = {row.trace_id: row for row in existing_rows.scalars().all()}
+
+        now = datetime.now(timezone.utc)
+        written = 0
+        for trace_id, outcome in latest.items():
+            row = existing.get(trace_id)
+            if row is None:
+                self.db.add(
+                    TraceOutcome(
+                        project_id=project_id,
+                        trace_id=trace_id,
+                        workflow=outcome.workflow,
+                        success=outcome.success,
+                        label=outcome.label,
+                        recorded_at=now,
+                    )
+                )
+            else:
+                row.success = outcome.success
+                row.label = outcome.label
+                row.workflow = outcome.workflow or row.workflow
+                row.recorded_at = now
+            written += 1
+
+        await self.db.flush()
+        return written
 
     async def get_events(
         self,

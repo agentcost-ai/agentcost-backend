@@ -21,6 +21,7 @@ class OptimizationType(str, Enum):
     BATCHING = "batching"
     ERROR_REDUCTION = "error_reduction"
     ANOMALY_ALERT = "anomaly_alert"
+    NON_LLM_CANDIDATE = "non_llm_candidate"
 
 
 class OptimizationService:
@@ -31,6 +32,13 @@ class OptimizationService:
 
     # Most recent events per (agent, model) inspected for capability hints.
     CAPABILITY_SAMPLE_ROWS = 200
+
+    # Classifier-shaped workload detection. Thresholds apply to the MAXIMUM
+    # output, not the average: an average stays low even when a tenth of the
+    # calls write prose, and those are the ones that break off an LLM.
+    CLASSIFIER_MAX_OUTPUT_TOKENS = 25
+    CLASSIFIER_MIN_CALLS = 50
+    CLASSIFIER_MIN_REPEAT_RATE = 0.20
 
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -111,6 +119,11 @@ class OptimizationService:
         
         latency_suggestions = await self._analyze_latency_issues(project_id, start_time, end_time)
         suggestions.extend(latency_suggestions)
+
+        classifier_suggestions = await self._analyze_non_llm_candidates(
+            project_id, start_time, end_time, days
+        )
+        suggestions.extend(classifier_suggestions)
         
         if not include_low_priority:
             suggestions = [s for s in suggestions if s.get("priority") != "low"]
@@ -873,6 +886,132 @@ class OptimizationService:
         
         return actions
     
+    async def _analyze_non_llm_candidates(
+        self,
+        project_id: str,
+        start_time: datetime,
+        end_time: datetime,
+        days: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find workloads that look like classification rather than generation.
+
+        Two signals, both from columns already collected and neither needing
+        content: every response was short, and inputs repeat. The savings
+        figure is a ceiling -- only the team can judge whether accuracy
+        survives the swap.
+        """
+        query = select(
+            Event.agent_name,
+            Event.model,
+            func.count(Event.id).label("calls"),
+            func.count(func.distinct(Event.input_hash)).label("distinct_inputs"),
+            func.max(Event.output_tokens).label("max_output"),
+            func.avg(Event.output_tokens).label("avg_output"),
+            func.sum(Event.cost).label("total_cost"),
+            func.avg(Event.latency_ms).label("avg_latency"),
+        ).where(
+            Event.project_id == project_id,
+            Event.timestamp >= start_time,
+            Event.timestamp <= end_time,
+            Event.success == True,  # noqa: E712 - failed calls have no output to judge
+            Event.input_hash.isnot(None),
+        ).group_by(
+            Event.agent_name, Event.model
+        ).having(
+            func.count(Event.id) >= self.CLASSIFIER_MIN_CALLS
+        )
+
+        result = await self.db.execute(query)
+        suggestions: List[Dict[str, Any]] = []
+
+        for row in result:
+            calls = int(row.calls or 0)
+            max_output = int(row.max_output or 0)
+            distinct_inputs = int(row.distinct_inputs or 0)
+            total_cost = float(row.total_cost or 0.0)
+
+            if max_output > self.CLASSIFIER_MAX_OUTPUT_TOKENS:
+                continue
+
+            # Entirely-unique inputs are open-ended work that answers briefly,
+            # not something a fixed label set replaces.
+            repeat_rate = 1 - (distinct_inputs / calls) if calls else 0.0
+            if repeat_rate < self.CLASSIFIER_MIN_REPEAT_RATE:
+                continue
+
+            monthly_ceiling = (total_cost / days) * 30 if days else total_cost
+            if monthly_ceiling < self.MIN_ACTIONABLE_SAVINGS:
+                continue
+
+            agent = row.agent_name
+            model = row.model
+            avg_output = round(float(row.avg_output or 0.0), 1)
+
+            suggestions.append({
+                "type": OptimizationType.NON_LLM_CANDIDATE.value,
+                "title": f"{agent} looks like classification, not generation",
+                "description": (
+                    f"'{agent}' made {calls:,} calls to {model} and never "
+                    f"returned more than {max_output} output tokens "
+                    f"(averaging {avg_output}). Inputs repeat "
+                    f"{round(repeat_rate * 100)}% of the time, so the input "
+                    "space is bounded. A smaller model, a trained classifier, "
+                    "or a lookup table would likely do the same job."
+                ),
+                "estimated_savings_monthly": round(monthly_ceiling, 2),
+                "estimated_savings_percent": 100.0,
+                "agent_name": agent,
+                "model": model,
+                "priority": self._calculate_priority(monthly_ceiling),
+                "action_items": self._build_non_llm_actions(
+                    agent=agent,
+                    model=model,
+                    max_output=max_output,
+                    repeat_rate=repeat_rate,
+                ),
+                "metrics": {
+                    "calls": calls,
+                    "distinct_inputs": distinct_inputs,
+                    "repeat_rate": round(repeat_rate * 100, 1),
+                    "max_output_tokens": max_output,
+                    "avg_output_tokens": avg_output,
+                    "avg_latency_ms": round(float(row.avg_latency or 0.0), 2),
+                    "window_cost": round(total_cost, 4),
+                    "coverage_days": days,
+                    "savings_is_ceiling": True,
+                },
+            })
+
+        suggestions.sort(
+            key=lambda s: s.get("estimated_savings_monthly") or 0, reverse=True
+        )
+        return suggestions
+
+    def _build_non_llm_actions(
+        self,
+        agent: str,
+        model: str,
+        max_output: int,
+        repeat_rate: float,
+    ) -> List[str]:
+        actions = [
+            f"Log {agent}'s inputs and outputs for a day to recover the label set",
+        ]
+        if repeat_rate >= 0.5:
+            actions.append(
+                f"Cache first: {round(repeat_rate * 100)}% of inputs repeat, "
+                "which is a same-day win needing no model change"
+            )
+        actions.extend([
+            f"Train a classifier on that log, or replace {model} with the "
+            "cheapest model that holds accuracy",
+            "Shadow the replacement against the current model before cutting over",
+            f"Keep {model} as the fallback for inputs the classifier scores "
+            "with low confidence",
+        ])
+        return actions
+
     def _calculate_priority(self, monthly_savings: float) -> str:
         """Calculate priority based on potential monthly savings."""
         if monthly_savings >= 50:
