@@ -73,22 +73,36 @@ async def ingest_events_batch(
             request.rejected[0].reason,
         )
 
-    def _response(stored: int) -> EventBatchResponse:
+    def _response(stored: int, outcomes: int = 0, duplicates: int = 0) -> EventBatchResponse:
         return EventBatchResponse(
             status="ok",
             events_stored=stored,
             timestamp=datetime.now(timezone.utc).isoformat(),
             events_received=request.received_count,
             events_rejected=len(request.rejected),
+            events_duplicate=duplicates,
+            outcomes_recorded=outcomes,
             # Enough to debug with, without echoing a whole junk batch back.
             rejected=request.rejected[:10],
         )
 
-    if not request.events:
-        return _response(0)
-
     event_service = EventService(db)
     budget_service = BudgetService(db)
+
+    # Outcomes are persisted before the early return below, and before event
+    # pricing, because they are independent of whether any event in this batch
+    # survived validation. Previously a batch whose events were all malformed
+    # returned early and took its perfectly valid outcomes with it -- and an
+    # outcome-only batch could not be sent at all.
+    try:
+        outcomes_written = await event_service.persist_outcomes(
+            project.id, request.outcomes
+        )
+    except Exception as exc:
+        raise _ingest_failed("recording outcomes", exc) from exc
+
+    if not request.events:
+        return _response(0, outcomes_written)
 
     try:
         prepared = await event_service.prepare_events_batch(
@@ -126,7 +140,6 @@ async def ingest_events_batch(
 
     try:
         count = await event_service.persist_events_batch(prepared)
-        await event_service.persist_outcomes(project.id, request.outcomes)
     except Exception as exc:
         raise _ingest_failed("ingesting", exc) from exc
 
@@ -151,7 +164,7 @@ async def ingest_events_batch(
                 "Budget threshold recording failed for project %s: %s", project.id, exc
             )
 
-    return _response(count)
+    return _response(count, outcomes_written, prepared.duplicates)
 
 
 @router.get("", response_model=list[EventResponse])

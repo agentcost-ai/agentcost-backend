@@ -5,6 +5,10 @@ from typing import List, Dict, Any, Optional, Tuple
 from enum import Enum
 
 from ..models.db_models import Event, ProjectBaseline
+
+# Reserved metadata key the SDK writes its capability fingerprint under.
+# Mirrors agentcost-sdk/agentcost/capabilities.py -- the two must not drift.
+CAPABILITY_KEY = "_ac_caps"
 from .analytics_service import AnalyticsService
 from .pricing_service import PricingService
 from .baseline_service import (
@@ -224,18 +228,37 @@ class OptimizationService:
 
             capability_state = capability_states[(agent, model)]
 
-            requires_vision = capability_state.get("requires_vision") == "true"
-            requires_function_calling = (
-                capability_state.get("requires_function_calling") == "true"
-            )
-            requires_json_mode = (
-                capability_state.get("requires_json_mode") == "true"
+            # Fail CLOSED on unknown, but proportionately.
+            #
+            # This used to read `== "true"`, so an unknown requirement -- the
+            # common case, since nothing populated the metadata it reads --
+            # was treated as "not required", and the optimizer would propose a
+            # text-only model for a workload sending images.
+            #
+            # For vision and tool calling, unknown now means "assume required",
+            # which narrows candidates to a capability superset of the current
+            # model. That is safe and still yields suggestions: a cheaper model
+            # supporting the same capabilities usually exists.
+            #
+            # JSON mode is different -- the catalogue has no per-model flag for
+            # it, so treating unknown as required would suppress every
+            # suggestion for every project without fingerprints. Only a
+            # positively known requirement blocks; unknown proceeds and the
+            # suggestion is labelled unverified.
+            def _assume_required(key: str) -> bool:
+                return capability_state.get(key) != "false"
+
+            requires_vision = _assume_required("requires_vision")
+            requires_function_calling = _assume_required("requires_function_calling")
+
+            if capability_state.get("requires_json_mode") == "true":
+                continue
+
+            capabilities_verified = capability_state.get("requires_vision") in (
+                "true",
+                "false",
             )
 
-            # If JSON mode is required but support cannot be verified, skip downgrade suggestions
-            if requires_json_mode:
-                continue
-            
             alternatives = await self._discover_alternatives_cached(
                 model=model,
                 avg_output_tokens=int(avg_output),
@@ -296,6 +319,12 @@ class OptimizationService:
                         "savings_percentage": alt["savings"]["percentage"],
                         "quality_impact": alt["quality_impact"],
                         "capability_requirements": capability_state,
+                        # False when the workload's requirements could not be
+                        # observed, so the candidate was filtered against an
+                        # assumed-required superset rather than a measured one.
+                        # A consumer applying these automatically should gate
+                        # on this; a human reading them should see a caveat.
+                        "capabilities_verified": capabilities_verified,
                         # Confidence data for "Proven" vs "Suggested" badge
                         "source": alt.get("source"),  # "learned" or "dynamic"
                         "confidence_score": alt.get("confidence_score"),
@@ -1094,6 +1123,19 @@ class OptimizationService:
 
             for meta in metadata_rows:
                 if not isinstance(meta, dict):
+                    continue
+
+                # The SDK's own fingerprint, when present, is authoritative:
+                # it was recorded from the request itself rather than inferred
+                # from whatever the caller happened to put in metadata.
+                caps = meta.get(CAPABILITY_KEY)
+                if isinstance(caps, dict):
+                    if caps.get("vision"):
+                        requires_vision = True
+                    if caps.get("tools"):
+                        requires_function_calling = True
+                    if caps.get("structured_output"):
+                        requires_json_mode = True
                     continue
 
                 if self._detect_vision(meta):

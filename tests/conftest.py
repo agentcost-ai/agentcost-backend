@@ -60,6 +60,27 @@ def no_outbound_email(monkeypatch, request):
     yield sent
 
 
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """Give each test a clean rate-limit bucket.
+
+    ``rate_limiter`` is a module-level singleton with a 100-request window, and
+    every test drives the app through the same in-process client -- so the
+    counter is shared across the whole session and requests accumulate against
+    one key. The suite therefore had a hard ceiling on its own size: adding
+    enough tests made *earlier, unrelated* ones start receiving 429s, failing
+    in ways that pointed nowhere near the cause.
+
+    Tests that exercise limiting itself construct their own RateLimiter and are
+    unaffected by this.
+    """
+    from app.utils.rate_limiter import rate_limiter
+
+    rate_limiter._requests.clear()
+    yield
+    rate_limiter._requests.clear()
+
+
 _SENT_EMAILS: list = []
 
 

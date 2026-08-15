@@ -15,6 +15,7 @@ from pydantic import (
 )
 from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime, timezone
+from urllib.parse import urlsplit
 from pydantic import model_validator
 
 
@@ -29,6 +30,15 @@ class EventCreate(BaseModel):
     # Optional: the server derives total_tokens and re-prices cost itself, so
     # requiring them would only reject batches it can already handle.
     total_tokens: Optional[int] = Field(default=None, ge=0)
+
+    # Prompt-cache accounting. The SDK has always read these off the provider
+    # response; before they were declared here Pydantic's default
+    # extra="ignore" dropped them silently and the server repriced the full
+    # input at full rate, overstating cost on every cache-heavy workload.
+    cached_tokens: Optional[int] = Field(default=None, ge=0)
+    cache_write_tokens: Optional[int] = Field(default=None, ge=0)
+    streaming: Optional[bool] = None
+
     cost: float = Field(default=0.0, ge=0)
     latency_ms: int = Field(default=0, ge=0)
     timestamp: str
@@ -37,13 +47,18 @@ class EventCreate(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     # Hash of normalized input text for caching pattern detection
     input_hash: Optional[str] = Field(None, max_length=64)
+    # Client-supplied idempotency key; a repeat is ignored rather than stored.
+    event_id: Optional[str] = Field(None, max_length=64)
 
     # Trace structure, emitted by SDKs that use workflow()/step()/tool().
     # Every field is optional: older SDKs, and calls made outside a workflow,
     # send none of them and must keep ingesting exactly as before.
-    trace_id: Optional[str] = Field(None, max_length=32)
-    span_id: Optional[str] = Field(None, max_length=32)
-    parent_span_id: Optional[str] = Field(None, max_length=32)
+    # 64 so a run id minted by another system fits -- a canonical UUID is 36
+    # characters and used to be rejected here, which silently dropped every
+    # event of a run correlated with an external control plane.
+    trace_id: Optional[str] = Field(None, max_length=64)
+    span_id: Optional[str] = Field(None, max_length=64)
+    parent_span_id: Optional[str] = Field(None, max_length=64)
     workflow: Optional[str] = Field(None, max_length=255)
     step_name: Optional[str] = Field(None, max_length=255)
     step_index: Optional[int] = Field(None, ge=0)
@@ -60,6 +75,18 @@ class EventCreate(BaseModel):
             return v
         except ValueError:
             raise ValueError('Invalid timestamp format. Use ISO 8601.')
+
+    @model_validator(mode="after")
+    def clamp_cached_tokens(self):
+        """Cache counts are a subset of input_tokens, not an addition to it.
+
+        A provider that reports them inconsistently (or a hand-rolled emitter
+        that adds them on top) would otherwise drive the non-cached remainder
+        negative and produce a credit.
+        """
+        if self.cached_tokens is not None:
+            self.cached_tokens = min(self.cached_tokens, self.input_tokens)
+        return self
 
 
 class RejectedEvent(BaseModel):
@@ -87,9 +114,11 @@ def _describe(exc: ValidationError) -> str:
 
 
 class OutcomeCreate(BaseModel):
-    """How one run ended, as reported by the SDK."""
+    """How one run ended, as reported by the SDK or an external control plane."""
 
-    trace_id: str = Field(..., min_length=1, max_length=32)
+    # Must match EventCreate.trace_id's width, or an outcome cannot be reported
+    # for a run whose events were accepted.
+    trace_id: str = Field(..., min_length=1, max_length=64)
     workflow: Optional[str] = Field(None, max_length=255)
     success: bool = True
     label: Optional[str] = Field(None, max_length=255)
@@ -104,7 +133,12 @@ class EventBatchRequest(BaseModel):
     """
 
     project_id: str = Field(..., min_length=1)
-    events: List[EventCreate] = Field(..., max_length=_MAX_EVENTS_PER_BATCH)
+    # Defaulted, not required: an outcome-only batch is legitimate. A control
+    # plane that ends a run by denying it -- and so produced no LLM call of its
+    # own -- still has the most important thing to say about that run.
+    events: List[EventCreate] = Field(
+        default_factory=list, max_length=_MAX_EVENTS_PER_BATCH
+    )
     # Absent from older SDKs, and from any batch whose runs declared none.
     outcomes: List[OutcomeCreate] = Field(
         default_factory=list, max_length=_MAX_EVENTS_PER_BATCH
@@ -143,7 +177,12 @@ class EventBatchRequest(BaseModel):
 
         raw = data.get("events")
         if raw is None or (isinstance(raw, list) and not raw):
-            raise ValueError("At least one event is required.")
+            # An outcome-only batch is legitimate: a control plane that ends a
+            # run by denying it produced no LLM call of its own, but still has
+            # the most important thing to say about that run.
+            if data.get("outcomes"):
+                return handler({**data, "events": []})
+            raise ValueError("A batch must carry at least one event or outcome.")
         if not isinstance(raw, list):
             return handler(data)  # wrong type entirely — let field validation say so
 
@@ -185,6 +224,10 @@ class EventBatchResponse(BaseModel):
     timestamp: str
     events_received: int = 0
     events_rejected: int = 0
+    # Accepted but not stored because an event with the same event_id already
+    # exists. Distinct from rejected: a duplicate is a successful no-op.
+    events_duplicate: int = 0
+    outcomes_recorded: int = 0
     rejected: List[RejectedEvent] = Field(default_factory=list)
 
 
@@ -448,10 +491,128 @@ class ProjectResponse(BaseModel):
 
 class ProjectUpdate(BaseModel):
     """Update project request"""
-    
+
     name: Optional[str] = Field(None, max_length=255)
     description: Optional[str] = None
     is_active: Optional[bool] = None
+
+
+# Hosts allowed to receive webhooks over plain http, for local development.
+_WEBHOOK_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+class ProjectWebhookUpdate(BaseModel):
+    """Configure signed push egress for budget events.
+
+    Send ``url: null`` to disable; this also clears the stored secret. When
+    ``url`` is set, omitting ``secret`` keeps the existing one and an empty
+    string clears it. The secret is write-only — no endpoint returns it, only
+    whether one is set.
+    """
+
+    url: Optional[str] = Field(None, max_length=2048)
+    secret: Optional[str] = Field(None, max_length=128)
+
+    @field_validator("url")
+    @classmethod
+    def require_https(cls, value: Optional[str]) -> Optional[str]:
+        """Reject anything that would send a signed payload in the clear.
+
+        Localhost over http is allowed so an integration can be developed
+        against a local listener (delivery to it additionally requires
+        ``webhook_allow_private_urls`` in the server settings).
+        """
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        parts = urlsplit(value)
+        if not parts.hostname:
+            raise ValueError("Webhook URL must include a host.")
+        if parts.scheme == "https":
+            return value
+        if parts.scheme == "http" and parts.hostname in _WEBHOOK_LOCAL_HOSTS:
+            return value
+        raise ValueError("Webhook URL must use https (http is allowed for localhost only).")
+
+    @model_validator(mode="after")
+    def secret_requires_url(self):
+        """A secret without a URL would silently disable the webhook.
+
+        ``url`` is what distinguishes "replace the configuration" from
+        "disable it", so a secret rotation must restate the URL.
+        """
+        if self.secret is not None and self.url is None:
+            raise ValueError(
+                "Include url when setting a secret. Send url: null to disable the webhook."
+            )
+        return self
+
+
+class ProjectWebhookResponse(BaseModel):
+    """Current webhook configuration. Never echoes the secret."""
+
+    project_id: str
+    url: Optional[str] = None
+    secret_set: bool = False
+
+
+class ProjectWebhookTestResponse(BaseModel):
+    """Result of a test delivery to the configured webhook."""
+
+    delivered: bool
+    status_code: Optional[int] = None
+    error: Optional[str] = None
+
+
+class DimensionStat(BaseModel):
+    """Aggregates for one value of a grouping dimension."""
+
+    key: str
+    total_calls: int
+    total_tokens: int
+    total_cost: float
+    avg_latency_ms: float
+    success_rate: float
+
+
+class ProjectBudgetState(BaseModel):
+    """Compact budget position for machine consumers."""
+
+    project_id: str
+    enabled: bool
+    mode: str
+    currency: Optional[str] = None
+    budget: Optional[float] = None
+    spend_mtd: float
+    remaining: Optional[float] = None
+    utilization_percent: Optional[float] = None
+    thresholds: List[float] = Field(default_factory=list)
+    thresholds_crossed: List[float] = Field(default_factory=list)
+    exhausted: bool
+    period_key: Optional[str] = None
+    period_ends_at: str
+    as_of: str
+
+
+class CacheAnalytics(BaseModel):
+    """Prompt-cache performance and savings over a window, in USD.
+
+    ``read_savings`` compares actual cost against billing every cached token
+    at the full input rate; ``write_premium`` is the extra paid for cache
+    writes over the same baseline. Models with no published cache rate
+    contribute zero to both.
+    """
+
+    total_input_tokens: int
+    cached_tokens: int
+    cache_write_tokens: int
+    cache_hit_rate: float
+    events_with_cache: int
+    read_savings: float
+    write_premium: float
+    net_savings: float
 
 
 SupportedCurrency = Literal["USD", "INR"]

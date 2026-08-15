@@ -17,6 +17,8 @@ from ..models.schemas import (
     ModelStats,
     TimeSeriesPoint,
     ExecutiveReport,
+    DimensionStat,
+    CacheAnalytics,
 )
 from ..models.db_models import Project
 from ..services.analytics_service import AnalyticsService
@@ -83,6 +85,52 @@ async def get_agent_stats(
     
     analytics = AnalyticsService(db)
     return await analytics.get_agent_stats(project.id, start_time, end_time, limit)
+
+
+@router.get("/by/{dimension}", response_model=list[DimensionStat])
+async def get_dimension_stats(
+    dimension: Literal["user", "session", "workflow", "tool", "model", "agent"],
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
+    limit: int = Query(50, ge=1, le=500),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """
+    Cost and volume grouped by one dimension.
+
+    `user` and `session` are read from the `user_id` and `session_id` keys in
+    event metadata, promoted to indexed columns at ingest. Tag calls with
+    `track_costs.metadata(user_id=...)` to populate them — this is what answers
+    "what is each developer costing us".
+
+    Events with no value for the requested dimension are excluded, not grouped
+    under a placeholder.
+    """
+    start_time, end_time = parse_time_range(range)
+
+    analytics = AnalyticsService(db)
+    return await analytics.get_dimension_stats(
+        project.id, dimension, start_time, end_time, limit
+    )
+
+
+@router.get("/cache", response_model=CacheAnalytics)
+async def get_cache_analytics(
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """
+    Prompt-cache hit rate and what caching earned this window, in USD.
+
+    Savings are measured against billing every cached token at the full input
+    rate. A model with no published cache rate contributes zero, exactly as
+    ingest prices it.
+    """
+    start_time, end_time = parse_time_range(range)
+
+    analytics = AnalyticsService(db)
+    return await analytics.get_cache_stats(project.id, start_time, end_time)
 
 
 @router.get("/models", response_model=list[ModelStats])

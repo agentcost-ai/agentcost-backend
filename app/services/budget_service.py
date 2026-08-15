@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models.db_models import BudgetThresholdAlert, Event, Project
 from ..models.user_models import ProjectMember, User, UserRole
+from . import webhook_service
 from .currency_service import CurrencyService
 from .notification_service import NotificationService
 
@@ -155,6 +156,53 @@ class BudgetService:
             "fx_rate": fx_rate,
         }
 
+    async def budget_state(self, project: Project) -> dict[str, Any]:
+        """Compact budget position, shaped for polling by an enforcement point.
+
+        A policy layer that wants to gate agent actions on remaining budget
+        cannot call this inside its decision path -- a network hop blows any
+        sub-millisecond latency target. The intended pattern is to poll this
+        every N seconds and hold the answer as cached state, which is why the
+        payload is small, has no side effects, and carries ``as_of`` so a
+        consumer can reason about staleness.
+
+        Unlike ``evaluate``, this never adds an in-flight cost and never writes
+        threshold alerts.
+        """
+        evaluation = await self.evaluate(project, additional_cost=0.0, hot_path=True)
+
+        budget = evaluation.get("budget")
+        spend = evaluation.get("current_spend") or 0.0
+        remaining = round(budget - spend, 6) if budget is not None else None
+
+        now = datetime.now(timezone.utc)
+        # Month boundary, so a consumer can tell "nearly out with three weeks
+        # left" from "nearly out on the last day" without recomputing it.
+        if now.month == 12:
+            period_end = datetime(now.year + 1, 1, 1, tzinfo=timezone.utc)
+        else:
+            period_end = datetime(now.year, now.month + 1, 1, tzinfo=timezone.utc)
+
+        return {
+            "project_id": project.id,
+            "enabled": evaluation.get("enabled", False),
+            "mode": evaluation.get("mode", "off"),
+            "currency": evaluation.get("currency"),
+            "budget": budget,
+            "spend_mtd": round(spend, 6),
+            "remaining": remaining,
+            "utilization_percent": evaluation.get("utilization_percent"),
+            "thresholds": evaluation.get("thresholds", []),
+            "thresholds_crossed": evaluation.get("crossed_thresholds", []),
+            # True only when the project is configured to actually stop on
+            # exhaustion. A consumer enforcing on our behalf should respect
+            # the same distinction rather than blocking on utilization alone.
+            "exhausted": bool(evaluation.get("should_block")),
+            "period_key": evaluation.get("period_key"),
+            "period_ends_at": period_end.isoformat(),
+            "as_of": now.isoformat(),
+        }
+
     async def _existing_thresholds(self, project_id: str, period_key: str) -> set[float]:
         """Thresholds already alerted on for this project/month.
 
@@ -223,6 +271,24 @@ class BudgetService:
             inserted.append(normalized)
 
         if inserted and dispatch_notifications:
+            # Webhook first, and not awaited: an enforcement point acting on a
+            # budget crossing is time-sensitive in a way an email digest is not.
+            if project is not None and getattr(project, "webhook_url", None):
+                webhook_service.dispatch(
+                    project.webhook_url,
+                    "budget.threshold_crossed",
+                    {
+                        "project_id": project_id,
+                        "period_key": period_key,
+                        "thresholds_crossed": inserted,
+                        "spend_mtd": round(float(spent_amount), 6),
+                        "budget": round(float(budget_amount), 6),
+                        "utilization_percent": round(float(utilization_percent), 2),
+                        "currency": getattr(project, "budget_currency", "USD"),
+                        "mode": getattr(project, "budget_enforcement_mode", "off"),
+                    },
+                    secret=getattr(project, "webhook_secret", None),
+                )
             try:
                 await self._fanout_alerts(
                     project_id=project_id,

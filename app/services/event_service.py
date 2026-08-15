@@ -12,10 +12,27 @@ from typing import Dict, List, Optional, Tuple
 
 from ..models.db_models import Event, Project
 from ..models.schemas import EventCreate, OutcomeCreate
+from .pricing_math import COST_PRECISION as _COST_PRECISION
+from .pricing_math import price_event
 
-# Prices are quoted per 1000 tokens, so a single call's cost runs to small
-# fractions of a cent. Round at the precision PricingService prices with.
-_COST_PRECISION = 8
+# Column width for the dimensions promoted out of event metadata.
+_DIMENSION_MAX = 255
+
+
+def _dimension(metadata: Optional[dict], key: str) -> Optional[str]:
+    """Pull one groupable dimension out of caller metadata.
+
+    Coerced to str because callers pass integers for user ids as often as
+    strings, and a mixed-type column would split one developer's spend across
+    two group keys.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get(key)
+    if value is None or isinstance(value, (dict, list, bool)):
+        return None
+    text = str(value).strip()
+    return text[:_DIMENSION_MAX] if text else None
 
 
 @dataclass
@@ -32,6 +49,9 @@ class PreparedBatch:
     # (agent_name, input_hash) -> (occurrences, summed cost)
     pattern_counts: Dict[Tuple[str, str], Tuple[int, float]] = field(default_factory=dict)
     total_cost: float = 0.0
+    # Events skipped because their event_id was already stored. Reported back
+    # so a client can tell "your retry was a no-op" from "your event vanished".
+    duplicates: int = 0
 
 
 class EventService:
@@ -65,10 +85,30 @@ class EventService:
             # here so the whole batch costs one read + one write pass later.
             pattern_counts: dict[tuple[str, str], tuple[int, float]] = {}
             total_cost = 0.0
+            duplicates = 0
+
+            # One lookup for every idempotency key in the batch, not one per
+            # event. Also dedupes within the batch itself, since a client that
+            # re-sent a payload may have merged it with a fresh one.
+            seen_ids: set[str] = set()
+            batch_ids = {e.event_id for e in events if e.event_id}
+            if batch_ids:
+                existing_ids = await self.db.execute(
+                    select(Event.event_id).where(
+                        Event.project_id == project_id,
+                        Event.event_id.in_(list(batch_ids)),
+                    )
+                )
+                seen_ids = {row[0] for row in existing_ids}
 
             ingested_at = datetime.now(timezone.utc)
 
             for event_data in events:
+                if event_data.event_id:
+                    if event_data.event_id in seen_ids:
+                        duplicates += 1
+                        continue
+                    seen_ids.add(event_data.event_id)
                 # Pin the zone, then clamp: analytics bounds on
                 # `timestamp <= now(UTC)`, so a naive or future-dated row would
                 # be stored but invisible in every chart and KPI.
@@ -88,12 +128,13 @@ class EventService:
 
                 # Use cached pricing instead of per-event DB query
                 pricing = pricing_cache.get(event_data.model)
-                if pricing is not None:
-                    input_cost = (event_data.input_tokens / 1000) * pricing["input"]
-                    output_cost = (event_data.output_tokens / 1000) * pricing["output"]
-                    calculated_cost = round(input_cost + output_cost, _COST_PRECISION)
-                else:
-                    calculated_cost = 0.0
+                calculated_cost = price_event(
+                    pricing,
+                    input_tokens=event_data.input_tokens,
+                    output_tokens=event_data.output_tokens,
+                    cached_tokens=event_data.cached_tokens or 0,
+                    cache_write_tokens=event_data.cache_write_tokens or 0,
+                )
 
                 # Use server cost when available; fall back to SDK-provided cost.
                 # cost_source records *how* we priced it, so a fuzzy match
@@ -119,6 +160,9 @@ class EventService:
                     input_tokens=event_data.input_tokens,
                     output_tokens=event_data.output_tokens,
                     total_tokens=total_tokens,
+                    cached_tokens=event_data.cached_tokens,
+                    cache_write_tokens=event_data.cache_write_tokens,
+                    streaming=event_data.streaming,
                     cost=final_cost,
                     cost_source=cost_source,
                     latency_ms=event_data.latency_ms,
@@ -126,7 +170,10 @@ class EventService:
                     success=event_data.success,
                     error=event_data.error,
                     extra_data=event_data.metadata,
+                    user_id=_dimension(event_data.metadata, "user_id"),
+                    session_id=_dimension(event_data.metadata, "session_id"),
                     input_hash=event_data.input_hash,
+                    event_id=event_data.event_id,
                     trace_id=event_data.trace_id,
                     span_id=event_data.span_id,
                     parent_span_id=event_data.parent_span_id,
@@ -152,23 +199,81 @@ class EventService:
             rows=db_events,
             pattern_counts=pattern_counts,
             total_cost=round(total_cost, _COST_PRECISION),
+            duplicates=duplicates,
         )
 
     async def persist_events_batch(self, prepared: PreparedBatch) -> int:
-        """Write a prepared batch. Caller's transaction owns the commit."""
-        from .baseline_service import PatternAnalysisService
+        """Write a prepared batch. Caller's transaction owns the commit.
+
+        A concurrent delivery of the same batch can slip past the lookup dedup
+        in prepare_events_batch; the partial unique index on
+        (project_id, event_id) turns that race into an IntegrityError here.
+        One retry drops the rows the other request stored and persists the
+        rest. Anything still conflicting after that is a genuine error.
+        """
+        from sqlalchemy.exc import IntegrityError
 
         if not prepared.rows:
             return 0
 
-        self.db.add_all(prepared.rows)
-        await PatternAnalysisService(self.db).record_patterns_bulk(
-            project_id=prepared.project_id,
-            pattern_counts=prepared.pattern_counts,
-        )
-        await self.db.flush()  # Let get_db handle the final commit
+        try:
+            return await self._persist_rows(prepared)
+        except IntegrityError:
+            await self._drop_stored_duplicates(prepared)
+            if not prepared.rows:
+                return 0
+            return await self._persist_rows(prepared)
 
+    async def _persist_rows(self, prepared: PreparedBatch) -> int:
+        """One insert attempt, inside a savepoint so a conflict is retryable."""
+        from .baseline_service import PatternAnalysisService
+
+        async with self.db.begin_nested():
+            self.db.add_all(prepared.rows)
+            await PatternAnalysisService(self.db).record_patterns_bulk(
+                project_id=prepared.project_id,
+                pattern_counts=prepared.pattern_counts,
+            )
+            await self.db.flush()
         return len(prepared.rows)
+
+    async def _drop_stored_duplicates(self, prepared: PreparedBatch) -> None:
+        """Remove rows whose event_id was stored by a concurrent request.
+
+        Rebuilds the batch aggregates from the surviving rows so budget
+        evaluation and pattern counts reflect what is actually persisted.
+        """
+        batch_ids = [row.event_id for row in prepared.rows if row.event_id]
+        if not batch_ids:
+            return
+
+        stored = await self.db.execute(
+            select(Event.event_id).where(
+                Event.project_id == prepared.project_id,
+                Event.event_id.in_(batch_ids),
+            )
+        )
+        stored_ids = {row[0] for row in stored}
+        if not stored_ids:
+            return
+
+        surviving = [
+            row for row in prepared.rows
+            if not (row.event_id and row.event_id in stored_ids)
+        ]
+        prepared.duplicates += len(prepared.rows) - len(surviving)
+        prepared.rows = surviving
+
+        pattern_counts: Dict[Tuple[str, str], Tuple[int, float]] = {}
+        total_cost = 0.0
+        for row in surviving:
+            total_cost += row.cost
+            if row.input_hash:
+                key = (row.agent_name, row.input_hash)
+                occurrences, summed = pattern_counts.get(key, (0, 0.0))
+                pattern_counts[key] = (occurrences + 1, summed + row.cost)
+        prepared.pattern_counts = pattern_counts
+        prepared.total_cost = round(total_cost, _COST_PRECISION)
 
     async def persist_outcomes(
         self, project_id: str, outcomes: List[OutcomeCreate]

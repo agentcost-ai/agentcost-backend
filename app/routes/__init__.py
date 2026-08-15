@@ -12,8 +12,10 @@ from .attachments import router as attachments_router
 from .notifications import router as notifications_router
 from .currency import router as currency_router
 from .integrations import router as integrations_router
+from .metrics import router as metrics_router
 
 __all__ = [
+    "metrics_router",
     "events_router",
     "analytics_router",
     "projects_router",

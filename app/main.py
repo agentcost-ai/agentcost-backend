@@ -21,6 +21,7 @@ from .routes import (
     notifications_router,
     currency_router,
     integrations_router,
+    metrics_router,
 )
 from .routes.auth import router as auth_router
 from .routes.members import router as members_router
@@ -183,6 +184,7 @@ app.include_router(attachments_router)
 app.include_router(notifications_router)
 app.include_router(currency_router)
 app.include_router(integrations_router)
+app.include_router(metrics_router)
 app.include_router(admin_router)
 app.include_router(demo_router)
 

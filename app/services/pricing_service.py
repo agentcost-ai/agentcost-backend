@@ -13,12 +13,29 @@ from sqlalchemy import case, func, or_, select
 from ..common import MAX_PRICE_PER_1K
 from ..models.db_models import ModelPricing
 from ..config import get_settings
+from .pricing_math import price_event
 
 # Separators model vendors use between name components ('gpt-4o-mini-2024-07-18',
 # 'anthropic/claude-3-5-sonnet', 'gemini-1.5-pro-002').
 _TOKEN_SEPARATOR = re.compile(r"[-_/.:@ ]")
 # Upper bound on the IN list a fuzzy lookup may build.
 _MAX_FUZZY_CANDIDATES = 60
+
+
+def _per_1k(per_token) -> Optional[float]:
+    """Convert an upstream per-token price to per-1k, or None if unpublished.
+
+    Distinguishing None from 0.0 matters: None means "this model has no cache
+    rate, bill cached tokens at the full input rate", while 0.0 would mean
+    "cached tokens are free" and silently zero out real spend.
+    """
+    if per_token is None:
+        return None
+    try:
+        value = float(per_token)
+    except (TypeError, ValueError):
+        return None
+    return value * 1000 if value > 0 else None
 
 # Get configurable URLs from settings (with same defaults as fallback)
 _settings = get_settings()
@@ -96,6 +113,10 @@ class PricingService:
         return {
             "input": model.input_price_per_1k,
             "output": model.output_price_per_1k,
+            # None where the provider publishes no cache rate; callers fall
+            # back to the standard input rate rather than assuming a discount.
+            "cached_input": model.cached_input_price_per_1k,
+            "cache_write": model.cache_write_price_per_1k,
             "provider": model.provider,
             # "exact" | "fuzzy" — event_service records this as cost_source so
             # an approximated price is distinguishable from a real one.
@@ -256,6 +277,8 @@ class PricingService:
             pricing[m.model_name] = {
                 "input": m.input_price_per_1k,
                 "output": m.output_price_per_1k,
+                "cached_input": m.cached_input_price_per_1k,
+                "cache_write": m.cache_write_price_per_1k,
                 "provider": m.provider,
                 "max_tokens": m.max_tokens,
                 "supports_vision": m.supports_vision,
@@ -266,15 +289,26 @@ class PricingService:
         
         return pricing
     
-    async def calculate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
+    async def calculate_cost(
+        self,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+        cached_tokens: int = 0,
+        cache_write_tokens: int = 0,
+    ) -> float:
         """Calculate cost for a model call."""
         pricing = await self.get_model_pricing(model)
         if pricing is None:
             return 0.0
-        
-        input_cost = (input_tokens / 1000) * pricing["input"]
-        output_cost = (output_tokens / 1000) * pricing["output"]
-        return round(input_cost + output_cost, 8)
+
+        return price_event(
+            pricing,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+        )
     
     async def calculate_potential_savings(
         self,
@@ -294,16 +328,29 @@ class PricingService:
         percentage_savings = (absolute_savings / current_cost) * 100
         return (round(absolute_savings, 8), round(percentage_savings, 2))
     
-    async def sync_from_litellm(self, track_changes: bool = False) -> Dict[str, Any]:
-        """Sync pricing from LiteLLM's pricing database."""
-        client = await self._get_client()
-        
-        try:
-            response = await client.get(LITELLM_PRICING_URL)
-            response.raise_for_status()
-            pricing_data = response.json()
-        except Exception as e:
-            return {"status": "error", "error": str(e), "models_updated": 0}
+    async def sync_from_litellm(
+        self,
+        track_changes: bool = False,
+        bundle: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Sync pricing from LiteLLM's pricing database.
+
+        ``bundle`` supplies the same JSON directly instead of fetching it, for
+        deployments with no egress to GitHub. Parsing and validation are
+        identical either way -- an air-gapped catalogue must not be a
+        second-class one held to looser rules.
+        """
+        if bundle is not None:
+            pricing_data = bundle
+        else:
+            client = await self._get_client()
+
+            try:
+                response = await client.get(LITELLM_PRICING_URL)
+                response.raise_for_status()
+                pricing_data = response.json()
+            except Exception as e:
+                return {"status": "error", "error": str(e), "models_updated": 0}
         
         updated_count = 0
         created_count = 0
@@ -381,6 +428,17 @@ class PricingService:
             supports_function_calling = model_data.get("supports_function_calling", False)
             supports_streaming = model_data.get("supports_streaming", True)
 
+            # Prompt-cache rates. LiteLLM quotes per token like the others, and
+            # publishes them only for models that actually offer caching -- left
+            # as None otherwise so pricing falls back to the full input rate
+            # instead of silently discounting.
+            cached_input_price_per_1k = _per_1k(
+                model_data.get("cache_read_input_token_cost")
+            )
+            cache_write_price_per_1k = _per_1k(
+                model_data.get("cache_creation_input_token_cost")
+            )
+
             existing = existing_by_name.get(model_name)
 
             if existing:
@@ -427,6 +485,8 @@ class PricingService:
                 for field, value in (
                     ("input_price_per_1k", input_price_per_1k),
                     ("output_price_per_1k", output_price_per_1k),
+                    ("cached_input_price_per_1k", cached_input_price_per_1k),
+                    ("cache_write_price_per_1k", cache_write_price_per_1k),
                     ("provider", provider),
                     ("max_tokens", max_tokens),
                     ("max_input_tokens", max_input_tokens),
@@ -462,6 +522,8 @@ class PricingService:
                     model_name=model_name,
                     input_price_per_1k=input_price_per_1k,
                     output_price_per_1k=output_price_per_1k,
+                    cached_input_price_per_1k=cached_input_price_per_1k,
+                    cache_write_price_per_1k=cache_write_price_per_1k,
                     provider=provider,
                     max_tokens=max_tokens,
                     max_input_tokens=max_input_tokens,

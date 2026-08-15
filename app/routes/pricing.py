@@ -341,6 +341,19 @@ async def update_pricing(
     }
 
 
+async def _mark_sync_failed(db: AsyncSession, log_id: str, exc: Exception) -> None:
+    """Record a failed sync so its claim is not left 'running' forever."""
+    from sqlalchemy import update as sa_update
+
+    await db.rollback()
+    await db.execute(
+        sa_update(PricingSyncLog)
+        .where(PricingSyncLog.id == log_id)
+        .values(status="error", error_message=str(exc)[:500])
+    )
+    await db.commit()
+
+
 @router.post("/sync/litellm")
 async def sync_from_litellm(
     track_changes: bool = Query(False),
@@ -365,6 +378,7 @@ async def sync_from_litellm(
             detail="A pricing sync is already running. Try again in a few minutes.",
         )
 
+    log_id = log_entry.id
     pricing_service = PricingService(db)
     try:
         result = await pricing_service.sync_from_litellm(track_changes=track_changes)
@@ -385,17 +399,63 @@ async def sync_from_litellm(
         log_entry.error_message = result.get("error")
         await db.commit()
         return result
-    except HTTPException:
-        raise
     except Exception as exc:
-        await db.rollback()
-        from sqlalchemy import update as sa_update
-        await db.execute(
-            sa_update(PricingSyncLog)
-            .where(PricingSyncLog.id == log_entry.id)
-            .values(status="error", error_message=str(exc)[:500])
+        # HTTPExceptions included: any exit without a status write would
+        # leave the claim "running" and block the next sync.
+        await _mark_sync_failed(db, log_id, exc)
+        raise
+    finally:
+        await pricing_service.close()
+
+
+@router.post("/import")
+async def import_pricing_bundle(
+    bundle: dict,
+    track_changes: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    _admin: User = Depends(get_admin_user),
+):
+    """
+    Load a pricing catalogue from an uploaded bundle instead of the network.
+
+    For deployments that cannot reach GitHub — air-gapped, egress-restricted,
+    or simply unwilling to depend on a third party being up at sync time. The
+    bundle is LiteLLM's `model_prices_and_context_window.json` verbatim, so it
+    can be fetched on a connected machine, reviewed, and carried across.
+
+    Same parsing, sanity bounds and change tracking as the network sync; only
+    the source of the JSON differs.
+    """
+    from ..services.cron import claim_pricing_sync
+
+    if not isinstance(bundle, dict) or not bundle:
+        raise HTTPException(
+            status_code=422,
+            detail="Bundle must be a non-empty JSON object of model_name -> pricing.",
         )
+
+    log_entry = await claim_pricing_sync(db)
+    if log_entry is None:
+        raise HTTPException(
+            status_code=409,
+            detail="A pricing sync is already running. Try again in a few minutes.",
+        )
+
+    log_id = log_entry.id
+    pricing_service = PricingService(db)
+    try:
+        result = await pricing_service.sync_from_litellm(
+            track_changes=track_changes, bundle=bundle
+        )
+        log_entry.status = "error" if result.get("status") == "error" else "ok"
+        log_entry.models_created = result.get("models_created", 0)
+        log_entry.models_updated = result.get("models_updated", 0)
+        log_entry.models_skipped = result.get("models_skipped", 0)
+        log_entry.error_message = result.get("error")
         await db.commit()
+        return result
+    except Exception as exc:
+        await _mark_sync_failed(db, log_id, exc)
         raise
     finally:
         await pricing_service.close()

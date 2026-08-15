@@ -7,7 +7,7 @@ Business logic for analytics queries.
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, case
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from ..models.db_models import Event
 from ..utils.sql_dialect import as_utc_datetime, dialect_name, utc_timestamp
@@ -149,6 +149,139 @@ class AnalyticsService:
             ))
         
         return agents
+
+    # Dimensions promoted out of event metadata that analytics can group by.
+    # Deliberately a closed set: these map to indexed columns, so an arbitrary
+    # key would either fail or force an unindexed JSON scan.
+    GROUPABLE_DIMENSIONS = {
+        "user": Event.user_id,
+        "session": Event.session_id,
+        "workflow": Event.workflow,
+        "tool": Event.tool_name,
+        "model": Event.model,
+        "agent": Event.agent_name,
+    }
+
+    async def get_dimension_stats(
+        self,
+        project_id: str,
+        dimension: str,
+        start_time: datetime,
+        end_time: datetime,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Cost and volume grouped by one dimension.
+
+        This is what answers "which developer, which session, which workflow
+        is the spend actually in" -- questions the per-agent and per-model
+        breakdowns cannot express.
+
+        Rows where the dimension is NULL are excluded rather than bucketed
+        under a placeholder: an event with no user_id is untagged, not the
+        property of a user called "unknown", and folding them together would
+        make the biggest bucket meaningless.
+        """
+        column = self.GROUPABLE_DIMENSIONS.get(dimension)
+        if column is None:
+            raise ValueError(
+                f"Unknown dimension '{dimension}'. "
+                f"Expected one of: {', '.join(sorted(self.GROUPABLE_DIMENSIONS))}."
+            )
+
+        query = select(
+            column.label("key"),
+            func.count(Event.id).label("total_calls"),
+            func.sum(Event.total_tokens).label("total_tokens"),
+            func.sum(Event.cost).label("total_cost"),
+            func.avg(Event.latency_ms).label("avg_latency"),
+            func.sum(case((Event.success == True, 1), else_=0)).label("success_count"),  # noqa: E712
+        ).where(
+            Event.project_id == project_id,
+            Event.timestamp >= start_time,
+            Event.timestamp <= end_time,
+            column.isnot(None),
+        ).group_by(column).order_by(func.sum(Event.cost).desc()).limit(limit)
+
+        rows = []
+        for row in await self.db.execute(query):
+            total_calls = int(row.total_calls or 0)
+            success_count = int(row.success_count or 0)
+            rows.append({
+                "key": row.key,
+                "total_calls": total_calls,
+                "total_tokens": int(row.total_tokens or 0),
+                "total_cost": round(float(row.total_cost or 0.0), 6),
+                "avg_latency_ms": round(float(row.avg_latency or 0.0), 2),
+                "success_rate": round(
+                    (success_count / total_calls * 100) if total_calls else 100.0, 2
+                ),
+            })
+        return rows
+
+    async def get_cache_stats(
+        self, project_id: str, start_time: datetime, end_time: datetime
+    ) -> Dict[str, Any]:
+        """Prompt-cache totals and savings for a window, priced per model.
+
+        Savings compare actual cost against billing every cached token at the
+        model's full input rate. Models with no published cache rate saved
+        nothing and contribute zero, matching how ingest prices them.
+        """
+        from .pricing_service import PricingService
+
+        rows = await self.db.execute(
+            select(
+                Event.model,
+                func.sum(Event.input_tokens).label("input_tokens"),
+                func.sum(Event.cached_tokens).label("cached"),
+                func.sum(Event.cache_write_tokens).label("written"),
+                func.sum(case((Event.cached_tokens > 0, 1), else_=0)).label("cache_events"),
+            ).where(
+                Event.project_id == project_id,
+                Event.timestamp >= start_time,
+                Event.timestamp <= end_time,
+            ).group_by(Event.model)
+        )
+
+        total_input = cached_total = written_total = cache_events = 0
+        read_savings = write_premium = 0.0
+
+        pricing_service = PricingService(self.db)
+        try:
+            for row in rows:
+                cached = int(row.cached or 0)
+                written = int(row.written or 0)
+                total_input += int(row.input_tokens or 0)
+                cached_total += cached
+                written_total += written
+                cache_events += int(row.cache_events or 0)
+
+                if not cached and not written:
+                    continue
+                pricing = await pricing_service.get_model_pricing(row.model)
+                if not pricing:
+                    continue
+                input_rate = pricing.get("input") or 0.0
+                cached_rate = pricing.get("cached_input")
+                write_rate = pricing.get("cache_write")
+                if cached and cached_rate is not None:
+                    read_savings += (cached / 1000) * (input_rate - cached_rate)
+                if written and write_rate is not None:
+                    write_premium += (written / 1000) * (write_rate - input_rate)
+        finally:
+            await pricing_service.close()
+
+        hit_rate = (cached_total / total_input * 100) if total_input else 0.0
+        return {
+            "total_input_tokens": total_input,
+            "cached_tokens": cached_total,
+            "cache_write_tokens": written_total,
+            "cache_hit_rate": round(hit_rate, 2),
+            "events_with_cache": cache_events,
+            "read_savings": round(read_savings, 6),
+            "write_premium": round(write_premium, 6),
+            "net_savings": round(read_savings - write_premium, 6),
+        }
 
     async def get_distinct_model_count(
         self,

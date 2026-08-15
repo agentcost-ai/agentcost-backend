@@ -136,6 +136,7 @@ def _schema_fingerprint() -> str:
     parts.append(repr(_DESIRED_COLUMNS))
     parts.append(repr(_WIDEN_COLUMNS))
     parts.append(repr(_DESIRED_INDEXES))
+    parts.append(repr(_DESIRED_PARTIAL_UNIQUE_INDEXES))
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
@@ -203,6 +204,9 @@ _DESIRED_COLUMNS = {
     "projects": {
         "monthly_budget_usd": {"type": "FLOAT"},
         "budget_alert_thresholds": {"type": "JSON"},
+        # Signed push egress for budget threshold crossings.
+        "webhook_url":    {"type": "VARCHAR(2048)"},
+        "webhook_secret": {"type": "VARCHAR(128)"},
         "budget_enforcement_mode": {
             "type": "VARCHAR(20)",
             "default": "'off'",
@@ -219,7 +223,9 @@ _DESIRED_COLUMNS = {
         "cost_source": {"type": "VARCHAR(50)"},
         # SHA256 of normalized input for caching pattern detection
         "input_hash": {"type": "VARCHAR(64)"},
-        # Trace structure; all nullable.
+        # Trace structure; all nullable. Declared at 32 because that is what
+        # they shipped as -- widening to 64 is handled by _WIDEN_COLUMNS, which
+        # runs against tables that already have the column.
         "trace_id":       {"type": "VARCHAR(32)"},
         "span_id":        {"type": "VARCHAR(32)"},
         "parent_span_id": {"type": "VARCHAR(32)"},
@@ -228,6 +234,30 @@ _DESIRED_COLUMNS = {
         "step_index":     {"type": "INTEGER"},
         "depth":          {"type": "INTEGER"},
         "tool_name":      {"type": "VARCHAR(255)"},
+        # Prompt-cache accounting. Nullable: rows written before this existed
+        # have no cache breakdown and must not be assumed to be uncached.
+        "cached_tokens":       {"type": "INTEGER"},
+        "cache_write_tokens":  {"type": "INTEGER"},
+        "streaming":           {"type": "BOOLEAN"},
+        # Client-supplied idempotency key.
+        "event_id":   {"type": "VARCHAR(64)"},
+        # Dimensions promoted out of metadata so analytics can GROUP BY them.
+        # _backfill_dimensions promotes historical rows when these are added.
+        "user_id":    {"type": "VARCHAR(255)"},
+        "session_id": {"type": "VARCHAR(255)"},
+    },
+    "model_pricing": {
+        # Context/input cap, distinct from max_tokens (the output cap).
+        "max_input_tokens": {"type": "INTEGER"},
+        # Per-1k prompt-cache rates. NULL means the provider publishes none, in
+        # which case cached tokens bill at the standard input rate.
+        "cached_input_price_per_1k": {"type": "FLOAT"},
+        "cache_write_price_per_1k":  {"type": "FLOAT"},
+    },
+    "trace_outcomes": {
+        # Present in the model since the table shipped; listed so a deployment
+        # that created the table before this column existed still gets it.
+        "workflow": {"type": "VARCHAR(255)"},
     },
     "users": {
         "admin_notes":    {"type": "TEXT"},
@@ -252,11 +282,12 @@ _DESIRED_COLUMNS = {
     "feedback_comments": {
         "is_internal": {"type": "BOOLEAN", "default": "false"},
     },
-    "model_pricing": {
-        # Context/input cap, distinct from max_tokens (the output cap).
-        "max_input_tokens": {"type": "INTEGER"},
-    },
 }
+# NOTE: never list a table twice in the dict above. Python keeps the last key,
+# so the earlier entry's columns vanish silently -- and every test still passes,
+# because tests build the schema from the models rather than migrating it.
+# That happened once with model_pricing; test_database_migrations.py now parses
+# this literal and fails on a repeat.
 
 # Existing VARCHAR columns to widen: (table, column, new_length). Widening is
 # metadata-only on PostgreSQL; SQLite ignores VARCHAR lengths, so it is skipped.
@@ -264,6 +295,13 @@ _WIDEN_COLUMNS = [
     # Bedrock inference-profile ARNs exceed the old 100-char cap.
     ("events", "model", 255),
     ("daily_aggregates", "model", 255),
+    # 32 -> 64 so a run id minted by another system fits. A canonical UUID is
+    # 36 characters; at 32 every event of a correlated run was rejected by
+    # validation, which is silent from the sender's side.
+    ("events", "trace_id", 64),
+    ("events", "span_id", 64),
+    ("events", "parent_span_id", 64),
+    ("trace_outcomes", "trace_id", 64),
 ]
 
 
@@ -272,17 +310,35 @@ _WIDEN_COLUMNS = [
 _DESIRED_INDEXES = [
     ("idx_events_trace", "events", "project_id, trace_id"),
     ("idx_events_workflow", "events", "project_id, workflow, timestamp"),
+    ("idx_events_user", "events", "project_id, user_id, timestamp"),
+    ("idx_events_session", "events", "project_id, session_id, timestamp"),
+]
+
+# Partial unique indexes, applied with raw DDL because they carry a WHERE
+# clause. Both PostgreSQL and SQLite support this syntax. The events index is
+# what makes event_id idempotency race-proof: the ingest path's lookup dedup
+# cannot see a concurrent in-flight insert, the constraint can.
+_DESIRED_PARTIAL_UNIQUE_INDEXES = [
+    (
+        "uq_events_project_event_id",
+        "events",
+        "project_id, event_id",
+        "event_id IS NOT NULL",
+    ),
 ]
 
 
 async def _apply_index_migrations(conn) -> int:
     """Create any declared index the live schema is missing."""
     applied = 0
-    for name, table, columns in _DESIRED_INDEXES:
-        def _has_table(sync_conn, table_name=table):
-            return inspect(sync_conn).has_table(table_name)
 
-        if not await conn.run_sync(_has_table):
+    async def _has_table(table_name: str) -> bool:
+        return await conn.run_sync(
+            lambda sync_conn: inspect(sync_conn).has_table(table_name)
+        )
+
+    for name, table, columns in _DESIRED_INDEXES:
+        if not await _has_table(table):
             continue
         stmt = f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})"
         try:
@@ -291,6 +347,21 @@ async def _apply_index_migrations(conn) -> int:
         except Exception as exc:
             # Performance, never correctness: must not stop the app booting.
             logger.warning("Index migration skipped (%s): %s", name, exc)
+
+    for name, table, columns, predicate in _DESIRED_PARTIAL_UNIQUE_INDEXES:
+        if not await _has_table(table):
+            continue
+        stmt = (
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {name} "
+            f"ON {table} ({columns}) WHERE {predicate}"
+        )
+        try:
+            await conn.execute(text(stmt))
+            applied += 1
+        except Exception as exc:
+            # A failure here (e.g. pre-existing duplicates) degrades dedup to
+            # the ingest path's lookup; the app must still boot.
+            logger.warning("Unique index migration skipped (%s): %s", name, exc)
     return applied
 
 
@@ -382,7 +453,41 @@ async def _apply_column_migrations(conn):
                 else:
                     raise
 
+        added = {(table, column) for table, column, _spec in missing}
+        if ("events", "user_id") in added or ("events", "session_id") in added:
+            await _backfill_dimensions(conn)
+
     return applied
+
+
+async def _backfill_dimensions(conn) -> None:
+    """Promote user_id/session_id out of stored metadata for historical rows.
+
+    Runs once, when the columns are first added, so dimension analytics work
+    for existing data instead of starting empty. Mirrors the ingest-path
+    rules in event_service._dimension: strings and numbers only, trimmed,
+    capped at 255; booleans and structured values are skipped.
+    """
+    if conn.dialect.name == "postgresql":
+        template = (
+            "UPDATE events SET {col} = LEFT(TRIM(extra_data->>'{key}'), 255) "
+            "WHERE {col} IS NULL "
+            "AND json_typeof(extra_data->'{key}') IN ('string', 'number') "
+            "AND NULLIF(TRIM(extra_data->>'{key}'), '') IS NOT NULL"
+        )
+    else:
+        template = (
+            "UPDATE events SET {col} = "
+            "SUBSTR(TRIM(CAST(json_extract(extra_data, '$.{key}') AS TEXT)), 1, 255) "
+            "WHERE {col} IS NULL "
+            "AND json_type(extra_data, '$.{key}') IN ('text', 'integer', 'real') "
+            "AND NULLIF(TRIM(CAST(json_extract(extra_data, '$.{key}') AS TEXT)), '') "
+            "IS NOT NULL"
+        )
+    for column, key in (("user_id", "user_id"), ("session_id", "session_id")):
+        result = await conn.execute(text(template.format(col=column, key=key)))
+        if result.rowcount:
+            logger.info("Backfilled events.%s for %s row(s)", column, result.rowcount)
 
 
 def _is_duplicate_column(exc: Exception) -> bool:

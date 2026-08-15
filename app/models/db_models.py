@@ -6,7 +6,7 @@ SQLAlchemy models for all database tables.
 
 from sqlalchemy import (
     Column, String, Integer, Float, Boolean, DateTime, Text, ForeignKey,
-    Index, JSON, UniqueConstraint
+    Index, JSON, UniqueConstraint, text
 )
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
@@ -39,6 +39,13 @@ class Project(Base):
     budget_enforcement_mode = Column(String(20), nullable=False, default="off")
     budget_currency = Column(String(3), nullable=False, default="USD")
 
+    # Push egress. Set to have budget threshold crossings POSTed as they
+    # happen, for a consumer that acts on cost signals and cannot poll --
+    # an enforcement point holding cached budget state, an ops channel, a SIEM.
+    # The secret signs each delivery (HMAC-SHA256 over timestamp.body).
+    webhook_url = Column(String(2048), nullable=True)
+    webhook_secret = Column(String(128), nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
@@ -65,7 +72,18 @@ class Event(Base):
     input_tokens = Column(Integer, nullable=False)
     output_tokens = Column(Integer, nullable=False)
     total_tokens = Column(Integer, nullable=False)
-    
+
+    # Subset of input_tokens served from the provider's prompt cache. Priced at
+    # the cache-read rate, which is a fraction of full input rate on every
+    # provider that offers it -- pricing the full input_tokens at full rate
+    # overstates cost on any cache-heavy workload, which is what coding agents
+    # are. NULL means the provider reported none (or the client is older).
+    cached_tokens = Column(Integer, nullable=True)
+    # Anthropic bills cache *writes* at a premium over standard input, so this
+    # cannot be folded into cached_tokens -- opposite sign.
+    cache_write_tokens = Column(Integer, nullable=True)
+    streaming = Column(Boolean, nullable=True)
+
     cost = Column(Float, nullable=False)
     # Track where the cost figure came from ('database', 'defaults', 'client-sdk')
     cost_source = Column(String(50), nullable=True)
@@ -78,15 +96,32 @@ class Event(Base):
     
     # using 'extra_data' instead of 'metadata' (reserved by SQLAlchemy)
     extra_data = Column(JSON, nullable=True)
+
+    # Promoted out of extra_data at ingest so analytics can GROUP BY them.
+    # JSON extraction differs between SQLite and PostgreSQL and indexes badly
+    # on both; two columns for the two dimensions people actually slice by
+    # (which developer, which conversation) is worth more than a general
+    # JSON-query facility nobody can index. Populated from the conventional
+    # metadata keys the SDK documents -- user_id and session_id.
+    user_id = Column(String(255), nullable=True)
+    session_id = Column(String(255), nullable=True)
     
     # Hash of normalized input for caching pattern detection
     input_hash = Column(String(64), nullable=True)
 
+    # Client-supplied idempotency key. A batch that succeeds server-side but
+    # times out client-side is re-sent by the SDK's retry queue; without this
+    # every such retry duplicates rows.
+    event_id = Column(String(64), nullable=True)
+
     # Trace structure. All nullable -- untraced calls have no place in a tree,
     # so queries must treat NULL as "untraced" rather than as a member.
-    trace_id = Column(String(32), nullable=True)
-    span_id = Column(String(32), nullable=True)
-    parent_span_id = Column(String(32), nullable=True)
+    # 64, not 32: an id minted by another system (a canonical UUID is 36 chars)
+    # has to fit, or joining a run to a foreign control plane silently drops
+    # every event.
+    trace_id = Column(String(64), nullable=True)
+    span_id = Column(String(64), nullable=True)
+    parent_span_id = Column(String(64), nullable=True)
     workflow = Column(String(255), nullable=True)
     step_name = Column(String(255), nullable=True)
     # Orders steps that ran concurrently, which timestamps cannot.
@@ -105,6 +140,19 @@ class Event(Base):
         Index("idx_events_input_hash", "project_id", "input_hash"),
         Index("idx_events_trace", "project_id", "trace_id"),
         Index("idx_events_workflow", "project_id", "workflow", "timestamp"),
+        Index("idx_events_user", "project_id", "user_id", "timestamp"),
+        Index("idx_events_session", "project_id", "session_id", "timestamp"),
+        # Enforces event_id idempotency under concurrency; the ingest path's
+        # lookup dedup handles the common case, this catches the race. Also
+        # serves the lookup itself.
+        Index(
+            "uq_events_project_event_id",
+            "project_id",
+            "event_id",
+            unique=True,
+            postgresql_where=text("event_id IS NOT NULL"),
+            sqlite_where=text("event_id IS NOT NULL"),
+        ),
     )
     
     def __repr__(self):
@@ -174,7 +222,13 @@ class ModelPricing(Base):
     
     input_price_per_1k = Column(Float, nullable=False, default=0.0)
     output_price_per_1k = Column(Float, nullable=False, default=0.0)
-    
+
+    # Prompt-cache rates, both per 1k tokens. NULL means the provider does not
+    # publish one for this model, in which case cached tokens are billed at the
+    # standard input rate -- never guessed at a discount.
+    cached_input_price_per_1k = Column(Float, nullable=True)
+    cache_write_price_per_1k = Column(Float, nullable=True)
+
     provider = Column(String(50), nullable=False, default="unknown")
     is_active = Column(Boolean, default=True)
     notes = Column(Text, nullable=True)
@@ -455,7 +509,8 @@ class TraceOutcome(Base):
 
     id = Column(String(36), primary_key=True, default=generate_uuid)
     project_id = Column(String(36), ForeignKey("projects.id"), nullable=False)
-    trace_id = Column(String(32), nullable=False)
+    # Must match Event.trace_id's width -- see the note there.
+    trace_id = Column(String(64), nullable=False)
 
     workflow = Column(String(255), nullable=True)
     success = Column(Boolean, nullable=False, default=True)

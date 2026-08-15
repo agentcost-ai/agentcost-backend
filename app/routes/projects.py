@@ -15,9 +15,14 @@ from ..models.schemas import (
     ProjectUpdate,
     ProjectBudgetUpdate,
     ProjectBudgetResponse,
+    ProjectWebhookUpdate,
+    ProjectWebhookResponse,
+    ProjectWebhookTestResponse,
+    ProjectBudgetState,
 )
 from ..models.db_models import Project
 from ..models.user_models import User
+from ..services import webhook_service
 from ..services.event_service import ProjectService
 from ..services.budget_service import BudgetService
 from ..services.permission_service import PermissionService, Permission
@@ -265,6 +270,144 @@ async def get_project_budget(
         budget_currency=evaluation.get("currency") or "USD",
         fx_rate=float(evaluation.get("fx_rate") or 1.0),
     )
+
+
+@router.get("/{project_id}/webhook", response_model=ProjectWebhookResponse)
+async def get_project_webhook(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_required_user),
+):
+    """Current webhook configuration. The secret is never returned."""
+    permission_service = PermissionService(db)
+    try:
+        await permission_service.require_permission(
+            current_user.id, project_id, Permission.VIEW_PROJECT
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+    project = await ProjectService(db).get_by_id(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    return ProjectWebhookResponse(
+        project_id=project.id,
+        url=project.webhook_url,
+        secret_set=bool(project.webhook_secret),
+    )
+
+
+@router.put("/{project_id}/webhook", response_model=ProjectWebhookResponse)
+async def update_project_webhook(
+    project_id: str,
+    request: ProjectWebhookUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_required_user),
+):
+    """
+    Configure signed push egress for budget threshold crossings.
+
+    Requires project-edit permission, not merely view: a webhook URL is an
+    exfiltration path for spend data.
+
+    Send `{"url": null}` to disable (this also clears the stored secret).
+    When `url` is set, omitting `secret` keeps the existing one and an empty
+    string clears it; a `secret` without a `url` is rejected.
+    """
+    permission_service = PermissionService(db)
+    try:
+        await permission_service.require_permission(
+            current_user.id, project_id, Permission.EDIT_PROJECT
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+    project = await ProjectService(db).get_by_id(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+
+    project.webhook_url = request.url
+    if request.url is None:
+        # Disabling the hook must not leave its secret behind.
+        project.webhook_secret = None
+    elif request.secret is not None:
+        project.webhook_secret = request.secret or None
+
+    await db.flush()
+
+    return ProjectWebhookResponse(
+        project_id=project.id,
+        url=project.webhook_url,
+        secret_set=bool(project.webhook_secret),
+    )
+
+
+@router.post("/{project_id}/webhook/test", response_model=ProjectWebhookTestResponse)
+async def test_project_webhook(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_required_user),
+):
+    """
+    Send a signed sample payload to the configured webhook, synchronously.
+
+    Lets an integration be verified at configuration time instead of at the
+    first real budget crossing. The payload shape and signature scheme match
+    live deliveries; only the event type (`webhook.test`) differs.
+    """
+    permission_service = PermissionService(db)
+    try:
+        await permission_service.require_permission(
+            current_user.id, project_id, Permission.EDIT_PROJECT
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+
+    project = await ProjectService(db).get_by_id(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found.")
+    if not project.webhook_url:
+        raise HTTPException(status_code=400, detail="No webhook URL is configured.")
+
+    result = await webhook_service.deliver(
+        project.webhook_url,
+        "webhook.test",
+        {
+            "project_id": project.id,
+            "message": "AgentCost webhook test delivery.",
+        },
+        secret=project.webhook_secret,
+    )
+    return ProjectWebhookTestResponse(
+        delivered=result.delivered,
+        status_code=result.status_code,
+        error=result.error,
+    )
+
+
+@router.get("/{project_id}/budget-state", response_model=ProjectBudgetState)
+async def get_project_budget_state(
+    project_id: str,
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access_for_path_id),
+):
+    """
+    Compact budget position for machine consumers.
+
+    Authenticated with the **project API key**, not a user session, so an
+    enforcement point can poll it with the same credential it uses to send
+    events.
+
+    Intended use is polling — every 15–60s — and holding the result as cached
+    state. Do not call this inside a latency-sensitive decision path; `as_of`
+    is returned so a consumer can reason about how stale its copy is.
+
+    Read-only: unlike the ingest path, this never records threshold alerts and
+    never counts an in-flight cost.
+    """
+    budget_service = BudgetService(db)
+    return await budget_service.budget_state(project)
 
 
 @router.put("/{project_id}/budget", response_model=ProjectBudgetResponse)

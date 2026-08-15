@@ -123,6 +123,11 @@ class Settings(BaseSettings):
     # Rate limiting backend: "memory" (default) or "redis" (for multi-instance)
     rate_limit_backend: str = "memory"
     redis_url: str = ""
+
+    # Allow webhook deliveries to private/loopback addresses. Keep False in
+    # any multi-tenant deployment (SSRF guard); enable for local development
+    # or self-hosted installs that post to internal listeners.
+    webhook_allow_private_urls: bool = False
     
     # Request size limit (MB) - protects against oversized payloads
     max_request_size_mb: int = 10
