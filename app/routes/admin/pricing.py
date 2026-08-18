@@ -83,6 +83,8 @@ async def list_pricing_models(
                 "supports_vision": m.supports_vision,
                 "supports_function_calling": m.supports_function_calling,
                 "supports_streaming": m.supports_streaming,
+                "mode": m.mode,
+                "deprecation_date": m.deprecation_date,
                 "notes": m.notes,
                 "source_updated_at": m.source_updated_at.isoformat() if m.source_updated_at else None,
                 "updated_at": m.updated_at.isoformat() if m.updated_at else None,

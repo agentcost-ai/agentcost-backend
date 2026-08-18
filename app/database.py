@@ -253,6 +253,10 @@ _DESIRED_COLUMNS = {
         # which case cached tokens bill at the standard input rate.
         "cached_input_price_per_1k": {"type": "FLOAT"},
         "cache_write_price_per_1k":  {"type": "FLOAT"},
+        # LiteLLM's `mode` (chat, embedding, ...); NULL = unknown.
+        "mode": {"type": "VARCHAR(30)"},
+        # Upstream-announced retirement date, YYYY-MM-DD.
+        "deprecation_date": {"type": "VARCHAR(10)"},
     },
     "trace_outcomes": {
         # Present in the model since the table shipped; listed so a deployment

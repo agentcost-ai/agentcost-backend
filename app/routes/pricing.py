@@ -201,6 +201,10 @@ async def get_all_pricing(
             pricing[model.model_name] = {
                 'input': model.input_price_per_1k,
                 'output': model.output_price_per_1k,
+                # The SDK's cost calculator reads these two; omitting them made
+                # every client-side estimate bill cached tokens at full rate.
+                'cached_input': model.cached_input_price_per_1k,
+                'cache_write': model.cache_write_price_per_1k,
                 'provider': model.provider,
                 'updated_at': model.updated_at.isoformat() if model.updated_at else None,
             }
@@ -223,6 +227,37 @@ async def get_all_pricing(
         "pricing": pricing,
         "source": "defaults",
         "last_updated": None,
+    }
+
+
+@router.get("/deprecations")
+async def list_deprecations(db: AsyncSession = Depends(get_db)):
+    """Active models with an upstream-announced retirement date, soonest first.
+
+    Public. The dates come from LiteLLM's deprecation_date and refresh with
+    every pricing sync. Registered before /{model_name} so the literal path
+    wins over the catch-all.
+    """
+    rows = (await db.execute(
+        select(ModelPricing)
+        .where(
+            ModelPricing.is_active == True,  # noqa: E712
+            ModelPricing.deprecation_date.isnot(None),
+        )
+        .order_by(ModelPricing.deprecation_date.asc(), ModelPricing.model_name.asc())
+    )).scalars().all()
+
+    return {
+        "deprecations": [
+            {
+                "model": r.model_name,
+                "provider": r.provider,
+                "deprecation_date": r.deprecation_date,
+                "mode": r.mode,
+            }
+            for r in rows
+        ],
+        "count": len(rows),
     }
 
 

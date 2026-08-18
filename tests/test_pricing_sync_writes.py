@@ -181,9 +181,10 @@ async def test_collision_winner_is_the_median_not_the_last_key(
     row = (await test_session.execute(
         select(ModelPricing).where(ModelPricing.model_name == "shared")
     )).scalar_one()
-    # Median of the two plausible listings, never the $135 outlier.
-    assert row.input_price_per_1k == pytest.approx(0.0005)
-    assert row.output_price_per_1k == pytest.approx(0.00215)
+    # Never the $135 outlier; of the two plausible listings the cheaper middle
+    # wins (overstating a customer's spend is the worse failure).
+    assert row.input_price_per_1k == pytest.approx(0.00025)
+    assert row.output_price_per_1k == pytest.approx(0.00025)
     assert result["models_deduplicated"] == 2
 
 

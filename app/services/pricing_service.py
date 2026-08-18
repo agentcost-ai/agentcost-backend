@@ -83,6 +83,14 @@ PLATFORM_PROVIDERS = {
 # auto-reactivated when the model reappears upstream.
 AUTO_DEACTIVATED_MARKER = "auto-deactivated:"
 
+# The three reasons a sync retires a row. They are not interchangeable:
+# ABSENT rows keep a stale-but-real price and may still price exact lookups;
+# UNPRICED and REJECTED rows hold prices that can no longer be trusted
+# (model went free / non-token-priced, or every listing was a unit error).
+RETIRED_ABSENT_NOTE = AUTO_DEACTIVATED_MARKER + " absent from litellm feed"
+RETIRED_UNPRICED_NOTE = AUTO_DEACTIVATED_MARKER + " unpriced upstream"
+RETIRED_REJECTED_NOTE = AUTO_DEACTIVATED_MARKER + " no plausible listing upstream"
+
 
 class PricingService:
 
@@ -122,6 +130,9 @@ class PricingService:
             # an approximated price is distinguishable from a real one.
             "match": match,
             "matched_model": model.model_name,
+            # chat / embedding / image_generation / ... — discovery uses this
+            # so an embedding model is never offered as a cheaper chat model.
+            "mode": model.mode,
         }
 
     async def get_model_pricing(self, model_name: str) -> Optional[Dict[str, Any]]:
@@ -171,6 +182,20 @@ class PricingService:
 
         if model:
             return self._price_payload(model, "exact")
+
+        # A model retired upstream is still billable: its last-known rate is
+        # exact, where the fuzzy path below would silently bill a *sibling's*
+        # rate. Only rows retired for absence qualify — UNPRICED / REJECTED
+        # retirements hold prices that are wrong, not merely stale.
+        retired = (await self.db.execute(
+            select(ModelPricing).where(
+                ModelPricing.model_name == model_name,
+                ModelPricing.is_active == False,  # noqa: E712
+                ModelPricing.notes == RETIRED_ABSENT_NOTE,
+            )
+        )).scalar_one_or_none()
+        if retired:
+            return self._price_payload(retired, "exact")
 
         model_lower = model_name.strip().lower()
         if not model_lower:
@@ -283,6 +308,8 @@ class PricingService:
                 "max_tokens": m.max_tokens,
                 "supports_vision": m.supports_vision,
                 "supports_function_calling": m.supports_function_calling,
+                "mode": m.mode,
+                "deprecation_date": m.deprecation_date,
                 "pricing_source": m.pricing_source,
                 "updated_at": m.updated_at.isoformat() if m.updated_at else None,
             }
@@ -373,6 +400,11 @@ class PricingService:
         grouped: Dict[str, List[tuple]] = {}
         collision_count = 0
         rejected_count = 0
+        # Canonical names present upstream but with no token price (free tiers,
+        # per-image/per-second models). Distinguished from truly absent names so
+        # their retirement note does not claim they vanished — and so their
+        # stale price is never served as an exact match (see RETIRED_* notes).
+        unpriced_names = set()
 
         for model_key, model_data in pricing_data.items():
             if not isinstance(model_data, dict):
@@ -381,10 +413,6 @@ class PricingService:
 
             input_price = model_data.get("input_cost_per_token", 0)
             output_price = model_data.get("output_cost_per_token", 0)
-
-            if input_price == 0 and output_price == 0:
-                skipped_count += 1
-                continue
 
             # Use litellm_provider from the data if available, otherwise parse from key
             litellm_provider = model_data.get("litellm_provider")
@@ -397,6 +425,11 @@ class PricingService:
                 model_name = self._canonicalize_model_name(model_key, litellm_provider)
             else:
                 model_name, provider = self._parse_litellm_model_key(model_key)
+
+            if input_price == 0 and output_price == 0:
+                skipped_count += 1
+                unpriced_names.add(model_name)
+                continue
 
             if model_name in grouped:
                 collision_count += 1
@@ -411,7 +444,7 @@ class PricingService:
         written_names = set()
 
         for model_name, candidates in grouped.items():
-            chosen = self._select_representative(candidates)
+            chosen = self._select_representative(candidates, model_name)
             if chosen is None:
                 # Every listing is implausible; better no row (event_service
                 # falls back to the SDK's own cost) than a unit-error price.
@@ -422,11 +455,23 @@ class PricingService:
 
             _key, model_data, provider, input_price_per_1k, output_price_per_1k = chosen
 
-            max_tokens = model_data.get("max_tokens") or model_data.get("max_output_tokens")
+            # max_output_tokens first: LiteLLM's max_tokens is legacy and, on
+            # entries that never got max_output_tokens, holds the *context*
+            # window — stored here as the output cap, it overstated by 10-100x.
+            max_tokens = model_data.get("max_output_tokens") or model_data.get("max_tokens")
             max_input_tokens = model_data.get("max_input_tokens")
             supports_vision = model_data.get("supports_vision", False)
             supports_function_calling = model_data.get("supports_function_calling", False)
             supports_streaming = model_data.get("supports_streaming", True)
+
+            mode = model_data.get("mode")
+            if not isinstance(mode, str) or len(mode) > 30:
+                mode = None
+            deprecation_date = model_data.get("deprecation_date")
+            if not isinstance(deprecation_date, str) or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}", deprecation_date
+            ):
+                deprecation_date = None
 
             # Prompt-cache rates. LiteLLM quotes per token like the others, and
             # publishes them only for models that actually offer caching -- left
@@ -442,14 +487,23 @@ class PricingService:
             existing = existing_by_name.get(model_name)
 
             if existing:
+                # An admin's price correction outlasts the sync: rates and
+                # pricing_source stay theirs until they clear the override.
+                # Capabilities and caps still refresh from upstream.
+                admin_override = existing.pricing_source == "admin_override"
+
                 if track_changes:
                     old_input = existing.input_price_per_1k
                     old_output = existing.output_price_per_1k
-                    
+
                     input_change_pct = ((input_price_per_1k - old_input) / old_input * 100) if old_input > 0 else (100 if input_price_per_1k > 0 else 0)
                     output_change_pct = ((output_price_per_1k - old_output) / old_output * 100) if old_output > 0 else (100 if output_price_per_1k > 0 else 0)
-                    
-                    if abs(input_change_pct) > 1 or abs(output_change_pct) > 1:
+
+                    # Overridden rows keep their rates, so an upstream move is
+                    # not a change we applied — reporting it would be a lie.
+                    if not admin_override and (
+                        abs(input_change_pct) > 1 or abs(output_change_pct) > 1
+                    ):
                         changes["price_changes"].append({
                             "model": model_name,
                             "provider": provider,
@@ -460,7 +514,7 @@ class PricingService:
                             "new_output": round(output_price_per_1k, 6),
                             "output_change_pct": round(output_change_pct, 2),
                         })
-                    
+
                     if existing.supports_vision != supports_vision:
                         changes["capability_changes"].append({
                             "model": model_name, "change": "vision",
@@ -481,8 +535,7 @@ class PricingService:
                 # run dirtied all ~3,500 rows each sync, so the UPDATE count
                 # reported real churn as if it were price movement and the write
                 # cost was paid whether or not anything had changed upstream.
-                row_changed = False
-                for field, value in (
+                fields = [
                     ("input_price_per_1k", input_price_per_1k),
                     ("output_price_per_1k", output_price_per_1k),
                     ("cached_input_price_per_1k", cached_input_price_per_1k),
@@ -493,8 +546,20 @@ class PricingService:
                     ("supports_vision", supports_vision),
                     ("supports_function_calling", supports_function_calling),
                     ("supports_streaming", supports_streaming),
+                    ("mode", mode),
+                    ("deprecation_date", deprecation_date),
                     ("pricing_source", "litellm"),
-                ):
+                ]
+                if admin_override:
+                    fields = [
+                        (f, v) for f, v in fields
+                        if f not in ("input_price_per_1k", "output_price_per_1k",
+                                     "cached_input_price_per_1k",
+                                     "cache_write_price_per_1k", "pricing_source")
+                    ]
+
+                row_changed = False
+                for field, value in fields:
                     if getattr(existing, field) != value:
                         setattr(existing, field, value)
                         row_changed = True
@@ -530,6 +595,8 @@ class PricingService:
                     supports_vision=supports_vision,
                     supports_function_calling=supports_function_calling,
                     supports_streaming=supports_streaming,
+                    mode=mode,
+                    deprecation_date=deprecation_date,
                     pricing_source="litellm",
                     source_updated_at=datetime.now(timezone.utc),
                 )
@@ -546,9 +613,10 @@ class PricingService:
                 continue
             if name not in written_names and row.is_active:
                 row.is_active = False
-                row.notes = AUTO_DEACTIVATED_MARKER + (
-                    " no plausible listing upstream" if name in grouped
-                    else " absent from litellm feed"
+                row.notes = (
+                    RETIRED_REJECTED_NOTE if name in grouped
+                    else RETIRED_UNPRICED_NOTE if name in unpriced_names
+                    else RETIRED_ABSENT_NOTE
                 )
                 row.updated_at = datetime.now(timezone.utc)
                 deactivated_count += 1
@@ -615,7 +683,13 @@ class PricingService:
             output_price_per_1k = output_price * 1000
             provider = model_id.split("/")[0] if "/" in model_id else "unknown"
             model_name = model_id.split("/")[-1] if "/" in model_id else model_id
+            # context_length is the INPUT/context cap; the output cap lives in
+            # top_provider. Storing context into max_tokens (the output cap)
+            # overstated what these models can produce by 10-100x.
             context_length = model_data.get("context_length")
+            max_completion = (model_data.get("top_provider") or {}).get(
+                "max_completion_tokens"
+            )
             
             # Check for existing record by canonical (stripped) name
             query = select(ModelPricing).where(ModelPricing.model_name == model_name)
@@ -631,11 +705,14 @@ class PricingService:
                     continue
             
             if existing:
-                if existing.pricing_source != "litellm":
+                # LiteLLM stays the primary source, and an admin's price
+                # correction outlasts this sync too.
+                if existing.pricing_source not in ("litellm", "admin_override"):
                     existing.input_price_per_1k = input_price_per_1k
                     existing.output_price_per_1k = output_price_per_1k
                     existing.provider = provider
-                    existing.max_tokens = context_length
+                    existing.max_tokens = max_completion
+                    existing.max_input_tokens = context_length
                     existing.pricing_source = "openrouter"
                     existing.source_updated_at = datetime.now(timezone.utc)
                     updated_count += 1
@@ -645,7 +722,8 @@ class PricingService:
                     input_price_per_1k=input_price_per_1k,
                     output_price_per_1k=output_price_per_1k,
                     provider=provider,
-                    max_tokens=context_length,
+                    max_tokens=max_completion,
+                    max_input_tokens=context_length,
                     pricing_source="openrouter",
                     source_updated_at=datetime.now(timezone.utc),
                 )
@@ -663,15 +741,24 @@ class PricingService:
         }
     
     @staticmethod
-    def _select_representative(candidates: List[tuple]) -> Optional[tuple]:
+    def _select_representative(
+        candidates: List[tuple], model_name: str
+    ) -> Optional[tuple]:
         """Pick one ``(source_key, model_data, provider, input_1k, output_1k)``
         listing to represent a canonical model name, or None if none is usable.
 
         Listings above MAX_PRICE_PER_1K are discarded as upstream unit errors
         (no real model costs $10/1k; the admin routes enforce the same bound).
-        Of the rest, take the median by price: order-independent, so upstream
-        reshuffles cannot rewrite prices, and immune to a single broken listing.
-        A whole tuple is chosen so input/output stay one host's coherent pair.
+
+        The maker's own listing — the one whose source key IS the canonical
+        name — wins outright: resellers mirror first-party models, and letting
+        the median decide attributed claude-* rows to whichever host's key
+        sorted into the middle (snowflake, in production). Otherwise take the
+        median by price: order-independent, so upstream reshuffles cannot
+        rewrite prices, and immune to a single broken listing. Even counts
+        take the cheaper middle — for a cost tracker, overstating a customer's
+        spend is the worse failure. A whole tuple is chosen so input/output
+        stay one host's coherent pair.
         """
         sane = [
             c for c in candidates
@@ -679,9 +766,12 @@ class PricingService:
         ]
         if not sane:
             return None
+        for c in sane:
+            if c[0] == model_name:
+                return c
         # The source key breaks ties identically on every run.
         sane.sort(key=lambda c: (c[3], c[4], c[0]))
-        return sane[len(sane) // 2]
+        return sane[(len(sane) - 1) // 2]
 
     def _canonicalize_model_name(self, model_key: str, litellm_provider: str) -> str:
         """Canonicalize model name by stripping provider prefix for primary providers.
@@ -1012,6 +1102,18 @@ class PricingService:
             ModelPricing.is_active == True,
             ModelPricing.model_name != model,
             total_price < source_total_cost,
+        )
+
+        # An alternative must do the same job: ordering by price alone offered
+        # embedding models as "cheaper" chat models (they are ~100x cheaper —
+        # and useless for the workload). Unknown source mode is treated as
+        # chat; NULL rows (pre-mode syncs, openrouter) are assumed compatible.
+        source_mode = source_pricing.get("mode")
+        query = query.where(
+            or_(
+                ModelPricing.mode == (source_mode or "chat"),
+                ModelPricing.mode.is_(None),
+            )
         )
 
         if same_provider_only:

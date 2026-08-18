@@ -277,3 +277,47 @@ async def test_output_cap_is_not_filtered_against_input_size(
     names = {a["model"] for a in alts}
     assert "cheap-small-output" in names
     assert "cheap-small-context" not in names
+
+
+@pytest.mark.asyncio
+async def test_embeddings_are_not_offered_as_chat_alternatives(
+    test_session: AsyncSession,
+):
+    """Ordering by price alone put text-embedding-* at the top of every OpenAI
+    chat model's alternatives (verified against the production catalogue).
+    Rows with NULL mode predate the column and stay eligible."""
+    from app.services.pricing_service import PricingService
+
+    test_session.add_all([
+        ModelPricing(model_name="chat-src", input_price_per_1k=0.01,
+                     output_price_per_1k=0.03, provider="openai",
+                     is_active=True, mode="chat"),
+        ModelPricing(model_name="cheap-embedding", input_price_per_1k=0.00002,
+                     output_price_per_1k=0.0, provider="openai",
+                     is_active=True, mode="embedding"),
+        ModelPricing(model_name="cheap-chat", input_price_per_1k=0.001,
+                     output_price_per_1k=0.002, provider="openai",
+                     is_active=True, mode="chat"),
+        ModelPricing(model_name="cheap-unknown-mode", input_price_per_1k=0.002,
+                     output_price_per_1k=0.004, provider="openai",
+                     is_active=True, mode=None),
+    ])
+    await test_session.commit()
+
+    service = PricingService(test_session)
+    alts = await service._discover_dynamically(
+        model="chat-src",
+        source_pricing={"input": 0.01, "output": 0.03, "mode": "chat"},
+        source_total_cost=0.04,
+        source_provider="openai",
+        avg_input_tokens=None,
+        avg_output_tokens=None,
+        requires_vision=False,
+        requires_function_calling=False,
+        same_provider_only=False,
+        max_results=10,
+    )
+    names = {a["model"] for a in alts}
+    assert "cheap-embedding" not in names
+    assert "cheap-chat" in names
+    assert "cheap-unknown-mode" in names

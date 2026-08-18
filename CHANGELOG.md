@@ -7,6 +7,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed — pricing catalogue integrity (Aug 2026 sync audit)
+
+- **First-party listings now beat reseller medians.** With two same-priced
+  listings for one canonical name, the median (`len//2`) landed on the reseller's
+  key: production attributed `claude-sonnet-4-5` and `claude-haiku-4-5` to provider
+  `snowflake` and `gpt-oss-120b` to `sambanova`. The maker's own listing (source key
+  == canonical name) now wins outright; the median remains the fallback for models
+  with no first-party listing. Even-count medians now take the *cheaper* middle —
+  the old upper-middle billed `meta-llama/Meta-Llama-3-70B-Instruct` at anyscale's
+  $1.00/1k over hyperbolic's $0.10/1k. Against the live feed this corrects 78
+  providers and 56 prices.
+
+- **Embedding models are no longer offered as cheaper chat alternatives.**
+  Dynamic discovery ranked purely by price, so the top suggestions for gpt-4o were
+  four `text-embedding-*` models. LiteLLM's `mode` is now ingested and alternatives
+  must match the source model's mode (NULL rows stay eligible).
+
+- **Admin price overrides now outlast the sync.** `admin_override` was set by the
+  PATCH route but checked nowhere: the next sync (≤24h) silently restored upstream
+  rates and reset `pricing_source`. Both syncs now leave overridden rates and source
+  untouched; capabilities and caps still refresh, and the unapplied upstream move is
+  not reported as a price change.
+
+- **Models retired upstream remain billable at their last-known rate.** Deactivation
+  removed a row from *pricing*, not just from recommendations, so events for a
+  still-used retired model silently fuzzy-matched a sibling's rate. Exact lookups now
+  fall back to rows retired for absence. Rows retired for unit-error prices never
+  price anything, and a model still listed upstream but token-unpriced (went free, or
+  per-image/per-second) is retired with a distinct note and does not serve its stale
+  paid rate.
+
+- **The SDK now receives prompt-cache rates.** Public `GET /v1/pricing` omitted
+  `cached_input`/`cache_write`, which the SDK's cost calculator reads — every
+  client-side estimate billed cached tokens at the full input rate.
+
+- **Output caps corrected.** LiteLLM's legacy `max_tokens` was preferred over
+  `max_output_tokens`; on entries without the latter it holds the *context window*,
+  overstating the output cap by 10-100x. Preference flipped. The OpenRouter sync
+  stored `context_length` into `max_tokens` (the output cap); it now goes to
+  `max_input_tokens`, with `top_provider.max_completion_tokens` as the output cap.
+
+### Added — model lifecycle
+
+- **`deprecation_date` ingested from LiteLLM** (295 active models carry one today)
+  and exposed on admin listings and pricing payloads. New public
+  `GET /v1/pricing/deprecations` returns active models with an announced retirement
+  date, soonest first.
+
 ### Fixed — cost accuracy
 
 - **Prompt-cache tokens were discarded at ingest, overstating cost.**

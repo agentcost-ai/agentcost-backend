@@ -245,7 +245,13 @@ class ModelPricing(Base):
     supports_vision = Column(Boolean, default=False)
     supports_function_calling = Column(Boolean, default=False)
     supports_streaming = Column(Boolean, default=True)
-    
+
+    # What the model does (chat, embedding, image_generation, ...), from
+    # LiteLLM's `mode`. NULL = unknown (pre-mode rows, other sources).
+    mode = Column(String(30), nullable=True)
+    # Upstream-announced retirement date, YYYY-MM-DD. NULL = none announced.
+    deprecation_date = Column(String(10), nullable=True)
+
     # Source tracking for automated updates
     pricing_source = Column(String(50), default="manual")  # manual, litellm, openrouter
     source_updated_at = Column(DateTime(timezone=True), nullable=True)
