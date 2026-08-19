@@ -206,6 +206,9 @@ async def get_all_pricing(
                 'cached_input': model.cached_input_price_per_1k,
                 'cache_write': model.cache_write_price_per_1k,
                 'provider': model.provider,
+                # Catalogue metadata for the public models page.
+                'mode': model.mode,
+                'deprecation_date': model.deprecation_date,
                 'updated_at': model.updated_at.isoformat() if model.updated_at else None,
             }
         # last_updated = when the catalogue was last refreshed; per-model

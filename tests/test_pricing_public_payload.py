@@ -46,6 +46,10 @@ async def test_public_pricing_includes_cache_rates(client: AsyncClient, catalogu
     # while 0.0 would mean "cached tokens are free".
     assert pricing["plain-model"]["cached_input"] is None
     assert pricing["plain-model"]["cache_write"] is None
+    # Catalogue metadata for the public models page.
+    assert pricing["cache-model"]["mode"] == "chat"
+    assert pricing["cache-model"]["deprecation_date"] == "2026-12-31"
+    assert pricing["plain-model"]["mode"] is None
 
 
 @pytest.mark.asyncio
