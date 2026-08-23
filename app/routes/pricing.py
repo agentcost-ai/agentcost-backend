@@ -132,7 +132,102 @@ async def _last_synced_at(db: AsyncSession) -> Optional[datetime]:
     return (await db.execute(select(func.max(ModelPricing.updated_at)))).scalar()
 
 
-@router.get("/sync/status")
+# --- Public response schemas --------------------------------------------------
+# Declared through `responses=` rather than `response_model=` on purpose: these
+# four endpoints are the public contract that SDKs and agents already consume,
+# and response_model would re-serialise the payload (adding null keys on the
+# defaults path). This documents the exact shape without touching the wire.
+
+
+class PricingRates(BaseModel):
+    """One model's rates, in USD per 1,000 tokens."""
+
+    input: Optional[float] = Field(None, description="Cost per 1,000 input (prompt) tokens, USD.")
+    output: Optional[float] = Field(None, description="Cost per 1,000 output (completion) tokens, USD.")
+    cached_input: Optional[float] = Field(
+        None,
+        description=(
+            "Cost per 1,000 cached input tokens, USD. null means the provider "
+            "publishes no cached rate -- bill cached tokens at the full input rate."
+        ),
+    )
+    cache_write: Optional[float] = Field(
+        None, description="Cost per 1,000 tokens written to the prompt cache, USD. null if not published."
+    )
+    provider: Optional[str] = Field(None, description="Provider slug, e.g. openai, anthropic, google.")
+    mode: Optional[str] = Field(
+        None, description="Model modality: chat, embedding, image_generation, audio_transcription, ..."
+    )
+    deprecation_date: Optional[str] = Field(
+        None, description="Upstream-announced retirement date, YYYY-MM-DD. null if none announced."
+    )
+    updated_at: Optional[str] = Field(
+        None, description="ISO-8601 timestamp of when this model's price last changed."
+    )
+
+
+class PricingCatalogResponse(BaseModel):
+    """The full public model catalogue, keyed by model name."""
+
+    pricing: Dict[str, PricingRates] = Field(
+        ..., description="Model name -> rates. Keys are the names AgentCost bills against."
+    )
+    source: str = Field(
+        ..., description='"database" for the synced catalogue, "defaults" for the built-in fallback set.'
+    )
+    last_updated: Optional[str] = Field(
+        ..., description="ISO-8601 timestamp of the last successful catalogue sync; null if never synced."
+    )
+
+
+class ModelPricingResponse(BaseModel):
+    """Rates for one model, resolved the same way event ingestion resolves them."""
+
+    model: str = Field(..., description="The model name as requested.")
+    matched_to: Optional[str] = Field(
+        None, description="Catalogue entry the name resolved to, when the match was fuzzy rather than exact."
+    )
+    input: float = Field(..., description="Cost per 1,000 input tokens, USD. 0.0 when unknown.")
+    output: float = Field(..., description="Cost per 1,000 output tokens, USD. 0.0 when unknown.")
+    provider: str = Field(..., description='Provider slug, or "unknown" when the model is not in the catalogue.')
+    source: str = Field(..., description='"database", "database-fuzzy", or "fallback" when nothing matched.')
+
+
+class DeprecationEntry(BaseModel):
+    """A model with an announced retirement date."""
+
+    model: str = Field(..., description="Model name.")
+    provider: Optional[str] = Field(None, description="Provider slug.")
+    deprecation_date: Optional[str] = Field(None, description="Announced retirement date, YYYY-MM-DD.")
+    mode: Optional[str] = Field(None, description="Model modality.")
+
+
+class DeprecationsResponse(BaseModel):
+    """Active models with an announced retirement date, soonest first."""
+
+    deprecations: list[DeprecationEntry] = Field(..., description="Ordered by date ascending, then model name.")
+    count: int = Field(..., description="Number of entries returned.")
+
+
+class PricingSyncStatusResponse(BaseModel):
+    """Freshness and composition of the catalogue."""
+
+    status: str = Field(..., description='"synced", "partial", or "not_synced".')
+    message: str = Field(..., description="Human-readable summary of the same state.")
+    total_models: int = Field(..., description="Active models currently in the catalogue.")
+    fallback_models: int = Field(..., description="Size of the built-in fallback set used when the catalogue is empty.")
+    last_updated: Optional[str] = Field(..., description="ISO-8601 timestamp of the last successful sync.")
+    models_by_provider: Dict[str, int] = Field(..., description="Active model count per provider.")
+    models_by_source: Dict[str, int] = Field(..., description="Active model count per upstream pricing source.")
+    database_populated: bool = Field(..., description="False when the fallback set is being served.")
+    sync_endpoints: Dict[str, str] = Field(..., description="Admin-only endpoints that trigger a resync.")
+
+
+@router.get(
+    "/sync/status",
+    summary="Catalogue freshness",
+    responses={200: {"model": PricingSyncStatusResponse, "description": "Catalogue size, freshness and composition."}},
+)
 async def get_sync_status(db: AsyncSession = Depends(get_db)):
     """Get pricing sync status."""
     total_query = select(func.count(ModelPricing.id)).where(ModelPricing.is_active == True)
@@ -182,7 +277,11 @@ async def get_sync_status(db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.get("")
+@router.get(
+    "",
+    summary="List model pricing",
+    responses={200: {"model": PricingCatalogResponse, "description": "The full public catalogue, keyed by model name."}},
+)
 async def get_all_pricing(
     provider: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
@@ -233,7 +332,11 @@ async def get_all_pricing(
     }
 
 
-@router.get("/deprecations")
+@router.get(
+    "/deprecations",
+    summary="List announced model retirements",
+    responses={200: {"model": DeprecationsResponse, "description": "Models with an announced retirement date, soonest first."}},
+)
 async def list_deprecations(db: AsyncSession = Depends(get_db)):
     """Active models with an upstream-announced retirement date, soonest first.
 
@@ -264,7 +367,11 @@ async def list_deprecations(db: AsyncSession = Depends(get_db)):
     }
 
 
-@router.get("/{model_name}")
+@router.get(
+    "/{model_name}",
+    summary="Get pricing for one model",
+    responses={200: {"model": ModelPricingResponse, "description": "Resolved rates. Unknown models resolve to zeros with source=fallback rather than 404."}},
+)
 async def get_model_pricing(model_name: str, db: AsyncSession = Depends(get_db)):
     """Get pricing for a specific model.
 
