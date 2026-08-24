@@ -246,6 +246,18 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-API-Key", "Accept"],
+    # Without this a browser client cannot read its own remaining quota --
+    # cross-origin JS only sees the CORS-safelisted response headers.
+    expose_headers=[
+        "RateLimit",
+        "RateLimit-Policy",
+        "RateLimit-Limit",
+        "RateLimit-Remaining",
+        "RateLimit-Reset",
+        "Retry-After",
+        "Deprecation",
+        "Sunset",
+    ],
 )
 
 # Exception handlers -----------------------------------------------------------

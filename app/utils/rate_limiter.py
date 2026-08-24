@@ -16,6 +16,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from ..config import get_settings
+from .errors import error_body
 
 logger = logging.getLogger(__name__)
 
@@ -374,9 +375,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             reset_in = max(reset_in, key_reset)
         remaining = remaining or 0
 
-        # Add rate limit headers to all responses
+        # Rate limit headers on every response, in all three forms clients read:
+        # the current IETF draft (RateLimit-Policy / RateLimit), the earlier
+        # unprefixed triple, and the X- prefixed one we already emitted.
+        # Agents use these to pace themselves instead of discovering the limit
+        # by tripping it.
+        limit = settings.rate_limit_requests
+        window = settings.rate_limit_period
         headers = {
-            "X-RateLimit-Limit": str(settings.rate_limit_requests),
+            "RateLimit-Policy": f'"default";q={limit};w={window}',
+            "RateLimit": f'"default";r={remaining};t={reset_in}',
+            "RateLimit-Limit": str(limit),
+            "RateLimit-Remaining": str(remaining),
+            "RateLimit-Reset": str(reset_in),
+            "X-RateLimit-Limit": str(limit),
             "X-RateLimit-Remaining": str(remaining),
             "X-RateLimit-Reset": str(reset_in),
         }
@@ -385,10 +397,18 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             return JSONResponse(
                 status_code=429,
                 content={
-                    "detail": "Rate limit exceeded. Please slow down.",
+                    **error_body(
+                        429,
+                        f"Rate limit exceeded: {limit} requests per {window} seconds.",
+                        hint=(
+                            f"Wait {reset_in}s, then retry. The RateLimit and "
+                            "RateLimit-Policy response headers report your remaining "
+                            "quota on every request."
+                        ),
+                    ),
                     "retry_after": reset_in,
-                    "limit": settings.rate_limit_requests,
-                    "period": f"{settings.rate_limit_period} seconds",
+                    "limit": limit,
+                    "period": f"{window} seconds",
                 },
                 headers={
                     **headers,
