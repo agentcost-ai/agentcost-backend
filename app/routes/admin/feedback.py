@@ -14,11 +14,22 @@ from ...models.user_models import User
 from ...models.db_models import Feedback, FeedbackComment, FeedbackEvent
 from ...services.admin_service import update_feedback as svc_update_feedback
 from ...services.email_service import send_feedback_update_email
+from ...services.docs_feedback_service import summarize as summarize_docs_feedback
+from ...models.schemas import DocsFeedbackSummary
 from ._deps import require_superuser
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+@router.get("/docs-feedback", response_model=DocsFeedbackSummary)
+async def docs_feedback_summary(
+    db: AsyncSession = Depends(get_db),
+    admin: User = Depends(require_superuser),
+):
+    """Per-page tally of the public docs' "Was this page helpful?" votes."""
+    return await summarize_docs_feedback(db)
 
 
 @router.get("/feedback")
