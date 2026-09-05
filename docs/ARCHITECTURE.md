@@ -386,6 +386,29 @@ Read-only unless noted. Same project API key as ingest.
 | `POST /v1/integrations/openai/costs` | Retroactive import from OpenAI org billing. Admin key used once, never persisted. |
 | `POST /v1/integrations/anthropic/costs` | Same for Anthropic's cost report |
 
+### Guardrails
+
+A declared boundary per agent, judged against what the events table saw. Four
+boundaries, each optional: permitted tools (`allowed_tools`, judged on `tool_name`),
+read-only (judged through project tool tags), permitted models (`allowed_models`,
+judged on every call's `model`) and per-run limits (`max_tool_calls_per_run`,
+`max_cost_per_run_usd`, judged over calls sharing a `trace_id`). Separate from
+success rate: that measures whether calls raised, this measures whether agents
+stayed inside the boundary that was set.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /v1/guardrails` | Declarations for the project |
+| `GET /v1/guardrails/compliance` | Per agent over a window: `no_guardrail` / `compliant` / `breach`, spend and calls, tracked tool calls, `tool_usage` (calls, last seen, tag, breach kind per tool), `model_usage` (calls, cost, permitted per model), `run_stats` (p50 / p95 / max tool calls and cost per run, for choosing a limit), `breach_series` (breaching calls or runs per day), and breaches. A breach is `{kind, subject, count, limit, observed, last_seen}`: `subject` is the tool, the model, or the worst run's `trace_id`; `count` is breaching calls, or runs over the limit. Kinds: `undeclared_tool`, `write_in_readonly`, `undeclared_model`, `tool_calls_over_limit`, `run_cost_over_limit`. Untagged tools under a read-only agent are listed in `unknown_access_tools`, never judged. |
+| `PUT` / `DELETE /v1/projects/{id}/guardrails[/{agent}]` | Declare or remove an agent's boundary. Null means unbounded for every field. Project-edit permission. |
+| `PUT` / `DELETE /v1/projects/{id}/guardrails/tool-tags[/{tool}]` | Tag a tool `read` or `write`, so read-only can be judged without a per-agent allow-list |
+
+Breaches are alerted, not enforced: the batch is accepted and stored, then a
+`guardrail_breach` notification goes to the owner and accepted admins and a
+`guardrail.breach` webhook is dispatched — see [§11](#11-egress). Per-run limits
+are judged on the run's stored totals, so a limit crossed across several batches
+still alerts. The same (agent, subject, kind) is not re-alerted within an hour.
+
 ### Recommendation payload
 
 Relevant if a downstream system acts on a suggestion rather than displaying it. A
@@ -473,6 +496,23 @@ Threshold crossings are then POSTed as they happen.
 }
 ```
 
+Guardrail breaches use the same channel and signature, event type `guardrail.breach`,
+once per (agent, subject, kind) per hour. `subject` is the tool, the model, or the
+run's `trace_id`; `limit` and `observed` are set for per-run kinds:
+
+```json
+{
+  "event": "guardrail.breach",
+  "sent_at": "2026-09-05T09:14:02+00:00",
+  "data": {
+    "project_id": "3f2b1c8e-...", "agent_name": "support-triage",
+    "kind": "write_in_readonly", "subject": "delete_ticket",
+    "count": 3, "limit": null, "observed": null,
+    "observed_at": "2026-09-05T09:14:02+00:00"
+  }
+}
+```
+
 | Header | Meaning |
 |---|---|
 | `X-AgentCost-Event` | Event type |
@@ -540,6 +580,7 @@ Stated plainly, because they are easier to design around than to discover.
 | **Structured-output workloads are not rehomed** | The catalogue has no per-model JSON-mode flag, so a workload known to require structured output gets no downgrade suggestions. |
 | **Anthropic 1-hour cache writes are under-priced** | LiteLLM publishes only the 5-minute-TTL write rate; 1-hour-TTL writes bill at 2× standard input upstream but are priced here at the 5-minute rate. Splitting by TTL needs a per-TTL breakdown end to end. |
 | **Token totals exclude Anthropic cache writes** | `input_tokens` is normalised to prompt = uncached + cache reads; cache-write tokens are priced but not counted in `total_tokens`, so token analytics run slightly low on write-heavy calls. Cost is unaffected. |
+| **Guardrails observe, they do not block** | A breach is stored, alerted and reported; the call already happened. Compliance is computed per request over the window (no rollup), and only calls made inside `track_costs.tool()` on SDK ≥ 0.2.2 carry a `tool_name`, and per-run limits only see calls inside `track_costs.workflow()` — anything else is invisible to them. Model boundaries see every call. |
 | **Webhook delivery refuses private addresses** | The delivery-time SSRF guard resolves the host and refuses non-public addresses. Local listeners (including the `http://localhost` development exception) require `WEBHOOK_ALLOW_PRIVATE_URLS=true` in the server environment. |
 
 ---

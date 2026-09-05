@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models.db_models import (
     AdminActivityLog,
+    AgentGuardrail,
     DailyAggregate,
     Event,
     Feedback,
@@ -24,6 +25,7 @@ from ..models.db_models import (
     OptimizationRecommendation,
     Project,
     ProjectBaseline,
+    ToolAccessTag,
 )
 from ..models.user_models import PendingEmailInvitation, User, UserSession
 from ..services.email_service import send_account_deletion_email
@@ -244,6 +246,8 @@ async def delete_user_permanently(
             OptimizationRecommendation,
             ProjectBaseline,
             InputPatternCache,
+            AgentGuardrail,
+            ToolAccessTag,
         ):
             await db.execute(
                 delete(model).where(model.project_id.in_(owned_ids))

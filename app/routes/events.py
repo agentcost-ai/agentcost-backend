@@ -15,6 +15,7 @@ from ..models.schemas import EventBatchRequest, EventBatchResponse, EventRespons
 from ..models.db_models import Project
 from ..services.event_service import EventService
 from ..services.budget_service import BudgetService
+from ..services.guardrail_service import GuardrailService
 from ..utils.auth import validate_api_key, validate_project_access
 from ..config import get_settings
 
@@ -142,6 +143,14 @@ async def ingest_events_batch(
         count = await event_service.persist_events_batch(prepared)
     except Exception as exc:
         raise _ingest_failed("ingesting", exc) from exc
+
+    # Guardrail breaches raise notifications + the project webhook. Same
+    # contract as budget alerts: events are already flushed, so alerting
+    # failures are logged, never surfaced as an ingest error.
+    try:
+        await GuardrailService(db).alert_breaches(project, prepared.rows)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Guardrail breach alerting failed for project %s: %s", project.id, exc)
 
     # Record newly crossed thresholds for this month (deduplicated).
     # Fan-out to in-app notifications + email for owners/admins.

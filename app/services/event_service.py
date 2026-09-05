@@ -487,6 +487,7 @@ class ProjectService:
         from sqlalchemy import delete as sa_delete
 
         from ..models.db_models import (
+            AgentGuardrail,
             BudgetThresholdAlert,
             DailyAggregate,
             Event,
@@ -494,6 +495,7 @@ class ProjectService:
             Notification,
             OptimizationRecommendation,
             ProjectBaseline,
+            ToolAccessTag,
         )
         from ..models.user_models import PendingEmailInvitation, ProjectMember
 
@@ -509,6 +511,8 @@ class ProjectService:
             OptimizationRecommendation,
             ProjectBaseline,
             InputPatternCache,
+            AgentGuardrail,
+            ToolAccessTag,
             BudgetThresholdAlert,
             Notification,
             ProjectMember,

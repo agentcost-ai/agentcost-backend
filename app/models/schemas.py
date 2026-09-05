@@ -827,3 +827,184 @@ class FeedbackEventResponse(BaseModel):
     new_value: Optional[Dict[str, Any]] = None
     actor_id: Optional[str] = None
     created_at: datetime
+
+
+# ── Guardrails ──────────────────────────────────────────────────────────────
+# Declared agent policy vs observed tool usage. A separate concept from the
+# per-call success flag: success measures whether a call raised; compliance
+# measures whether an agent stayed inside its declared tool boundary.
+
+
+class GuardrailUpsert(BaseModel):
+    """Create or replace the guardrail for one agent."""
+
+    agent_name: str = Field(..., min_length=1, max_length=255)
+    # None = any tool permitted; [] = no tool calls permitted.
+    allowed_tools: Optional[List[str]] = Field(None, max_length=200)
+    read_only: bool = False
+    # None = any model permitted.
+    allowed_models: Optional[List[str]] = Field(None, max_length=200)
+    # Per-run limits over calls sharing a trace_id (inside workflow()).
+    max_tool_calls_per_run: Optional[int] = Field(None, ge=1, le=100_000)
+    max_cost_per_run_usd: Optional[float] = Field(None, gt=0, le=1_000_000)
+    enabled: bool = True
+
+    @field_validator("allowed_tools", "allowed_models")
+    @classmethod
+    def _names_fit_column(cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is None:
+            return v
+        cleaned = [t.strip() for t in v if t and t.strip()]
+        for name in cleaned:
+            if len(name) > 255:
+                raise ValueError("names must be at most 255 characters")
+        # Order-preserving dedup so the stored policy reads back as entered.
+        return list(dict.fromkeys(cleaned))
+
+
+class GuardrailResponse(BaseModel):
+    id: str
+    agent_name: str
+    allowed_tools: Optional[List[str]]
+    read_only: bool
+    allowed_models: Optional[List[str]] = None
+    max_tool_calls_per_run: Optional[int] = None
+    max_cost_per_run_usd: Optional[float] = None
+    enabled: bool
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ToolAccessTagUpsert(BaseModel):
+    tool_name: str = Field(..., min_length=1, max_length=255)
+    access: Literal["read", "write"]
+
+
+class ToolAccessTagResponse(BaseModel):
+    tool_name: str
+    access: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+BreachKind = Literal[
+    "undeclared_tool",
+    "write_in_readonly",
+    "undeclared_model",
+    "tool_calls_over_limit",
+    "run_cost_over_limit",
+]
+
+
+class GuardrailBreach(BaseModel):
+    kind: BreachKind
+    # The tool, the model, or -- for per-run kinds -- the worst run's trace_id.
+    subject: str
+    # Breaching calls, or runs over the limit for per-run kinds.
+    count: int
+    limit: Optional[float] = None
+    observed: Optional[float] = None
+    last_seen: Optional[datetime] = None
+
+
+class ToolUsage(BaseModel):
+    tool_name: str
+    calls: int
+    last_seen: Optional[datetime] = None
+    # Project tag, if any: read | write.
+    access: Optional[str] = None
+    # Set when calls to this tool breach the agent's guardrail.
+    breach_kind: Optional[BreachKind] = None
+
+
+class ModelUsage(BaseModel):
+    model: str
+    calls: int
+    cost: float
+    # False when the agent has a model allow-list that excludes this model.
+    permitted: bool = True
+
+
+class RunStats(BaseModel):
+    """Distribution of tool calls and cost per run (calls sharing a trace_id),
+    so a limit can be set from what the agent actually does."""
+
+    runs: int
+    p50_tool_calls: float
+    p95_tool_calls: float
+    max_tool_calls: int
+    p50_cost: float
+    p95_cost: float
+    max_cost: float
+
+
+class DailyBreaches(BaseModel):
+    day: str  # ISO date
+    count: int
+
+
+class AgentCompliance(BaseModel):
+    agent_name: str
+    status: Literal["no_guardrail", "compliant", "breach"]
+    read_only: bool = False
+    allowed_tools: Optional[List[str]] = None
+    allowed_models: Optional[List[str]] = None
+    max_tool_calls_per_run: Optional[int] = None
+    max_cost_per_run_usd: Optional[float] = None
+    total_calls: int = 0
+    total_cost: float = 0.0
+    tracked_tool_calls: int = 0
+    # Runs (distinct trace_ids) seen in the window.
+    runs_seen: int = 0
+    observed_tools: List[str] = Field(default_factory=list)
+    observed_models: List[str] = Field(default_factory=list)
+    tool_usage: List[ToolUsage] = Field(default_factory=list)
+    model_usage: List[ModelUsage] = Field(default_factory=list)
+    run_stats: Optional[RunStats] = None
+    # Breaching calls (or runs) per day across the window.
+    breach_series: List[DailyBreaches] = Field(default_factory=list)
+    breaches: List[GuardrailBreach] = Field(default_factory=list)
+    # Read-only agents calling tools with no read/write tag: reported, never
+    # silently counted as either compliant or breaching.
+    unknown_access_tools: List[str] = Field(default_factory=list)
+
+
+class GuardrailComplianceResponse(BaseModel):
+    agents: List[AgentCompliance]
+    tool_tags: List[ToolAccessTagResponse]
+    start_time: datetime
+    end_time: datetime
+    # Instrumentation coverage: tool-level compliance only sees calls wrapped
+    # in track_costs.tool(...).
+    total_calls: int
+    tool_tracked_calls: int
+
+
+# ── Docs feedback ────────────────────────────────────────────────────────────
+
+
+class DocsFeedbackCreate(BaseModel):
+    """A "Was this page helpful?" vote. Anonymous; only the page and the answer."""
+
+    page: str = Field(
+        ..., min_length=5, max_length=255, pattern=r"^/docs(/[A-Za-z0-9_\-]+)*/?$"
+    )
+    helpful: bool
+
+
+class DocsFeedbackPageSummary(BaseModel):
+    page: str
+    helpful: int
+    not_helpful: int
+    total: int
+    # helpful share in percent, None when there are no votes
+    score: Optional[float]
+    last_vote_at: Optional[datetime]
+
+
+class DocsFeedbackSummary(BaseModel):
+    pages: List[DocsFeedbackPageSummary]
+    total_votes: int
+    votes_last_30d: int

@@ -26,6 +26,8 @@ from .routes import (
     currency_router,
     integrations_router,
     metrics_router,
+    guardrails_router,
+    docs_feedback_router,
 )
 from .routes.auth import router as auth_router
 from .routes.members import router as members_router
@@ -152,6 +154,18 @@ async def lifespan(app: FastAPI):
 # Tag descriptions. Without these the published spec lists bare tag names, which
 # tells an agent nothing about which group of operations it wants.
 OPENAPI_TAGS = [
+    {"name": "Docs", "description": (
+        "Anonymous \"Was this page helpful?\" votes from the public documentation. "
+        "No credentials; the vote carries a page path and a yes/no, nothing else."
+    )},
+    {"name": "Guardrails", "description": (
+        "Declared agent policy — permitted tools and read-only flags — and the "
+        "compliance view judging observed tool usage against it. A separate "
+        "concept from success rate: success measures whether a call raised; "
+        "compliance measures whether an agent stayed inside its declared "
+        "boundary. Reads take the project API key; definitions require a "
+        "member session with EDIT_PROJECT."
+    )},
     {"name": "Pricing", "description": (
         "Public model catalogue. Per-1k input/output/cached rates, provider, mode and "
         "announced retirement dates for every model AgentCost can bill. No credentials "
@@ -311,6 +325,8 @@ app.include_router(notifications_router)
 app.include_router(currency_router)
 app.include_router(integrations_router)
 app.include_router(metrics_router)
+app.include_router(guardrails_router)
+app.include_router(docs_feedback_router)
 app.include_router(admin_router)
 app.include_router(demo_router)
 

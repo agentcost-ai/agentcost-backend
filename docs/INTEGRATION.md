@@ -265,8 +265,9 @@ curl -X POST https://api.agentcost.tech/v1/projects/$PROJECT_ID/webhook/test \
   -H "Authorization: Bearer $USER_JWT"
 ```
 
-Threshold crossings are POSTed as
-they happen, signed with `HMAC-SHA256(secret, "{timestamp}.{body}")` in
+Threshold crossings (`budget.threshold_crossed`) and guardrail breaches
+(`guardrail.breach`: agent, `kind` and `subject` — the tool, model or run that crossed
+the boundary, with `limit` and `observed` for per-run kinds) are POSTed as they happen, signed with `HMAC-SHA256(secret, "{timestamp}.{body}")` in
 `X-AgentCost-Signature`. Verify the timestamp is within your tolerance window *before*
 comparing the digest.
 

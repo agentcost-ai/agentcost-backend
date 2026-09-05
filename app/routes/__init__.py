@@ -13,9 +13,13 @@ from .notifications import router as notifications_router
 from .currency import router as currency_router
 from .integrations import router as integrations_router
 from .metrics import router as metrics_router
+from .guardrails import router as guardrails_router
+from .docs_feedback import router as docs_feedback_router
 
 __all__ = [
     "metrics_router",
+    "guardrails_router",
+    "docs_feedback_router",
     "events_router",
     "analytics_router",
     "projects_router",

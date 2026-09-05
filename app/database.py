@@ -201,6 +201,12 @@ async def create_tables() -> str:
 # Module level so _schema_fingerprint can hash it: editing this table must
 # invalidate the bootstrap cache, or the new column would never be applied.
 _DESIRED_COLUMNS = {
+    # Guardrail boundaries added after the table first shipped.
+    "agent_guardrails": {
+        "allowed_models":         {"type": "JSON"},
+        "max_tool_calls_per_run": {"type": "INTEGER"},
+        "max_cost_per_run_usd":   {"type": "FLOAT"},
+    },
     "projects": {
         "monthly_budget_usd": {"type": "FLOAT"},
         "budget_alert_thresholds": {"type": "JSON"},
@@ -316,6 +322,8 @@ _DESIRED_INDEXES = [
     ("idx_events_workflow", "events", "project_id, workflow, timestamp"),
     ("idx_events_user", "events", "project_id, user_id, timestamp"),
     ("idx_events_session", "events", "project_id, session_id, timestamp"),
+    # Guardrail compliance groups tool calls per window.
+    ("idx_events_tool", "events", "project_id, tool_name, timestamp"),
 ]
 
 # Partial unique indexes, applied with raw DDL because they carry a WHERE

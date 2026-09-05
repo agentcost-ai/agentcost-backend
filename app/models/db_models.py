@@ -138,6 +138,7 @@ class Event(Base):
         Index("idx_events_agent", "project_id", "agent_name", "timestamp"),
         Index("idx_events_model", "project_id", "model", "timestamp"),
         Index("idx_events_input_hash", "project_id", "input_hash"),
+        Index("idx_events_tool", "project_id", "tool_name", "timestamp"),
         Index("idx_events_trace", "project_id", "trace_id"),
         Index("idx_events_workflow", "project_id", "workflow", "timestamp"),
         Index("idx_events_user", "project_id", "user_id", "timestamp"),
@@ -533,6 +534,84 @@ class TraceOutcome(Base):
 
     def __repr__(self):
         return f"<TraceOutcome {self.trace_id} success={self.success}>"
+
+
+class AgentGuardrail(Base):
+    """Declared policy for one agent: permitted tools, read-only, permitted
+    models and per-run limits. Compliance is judged against observed events
+    -- deliberately separate from Event.success, which measures call outcome."""
+
+    __tablename__ = "agent_guardrails"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id"), nullable=False)
+    agent_name = Column(String(255), nullable=False)
+
+    # NULL = any tool permitted; [] = no tool calls permitted.
+    allowed_tools = Column(JSON, nullable=True)
+    read_only = Column(Boolean, nullable=False, default=False)
+    # NULL = any model permitted.
+    allowed_models = Column(JSON, nullable=True)
+    # Per-run limits, judged over calls that share a trace_id. NULL = no limit.
+    max_tool_calls_per_run = Column(Integer, nullable=True)
+    max_cost_per_run_usd = Column(Float, nullable=True)
+    enabled = Column(Boolean, nullable=False, default=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "agent_name", name="uq_guardrail_project_agent"),
+        Index("idx_guardrails_project", "project_id"),
+    )
+
+    def __repr__(self):
+        return f"<AgentGuardrail {self.project_id} - {self.agent_name}>"
+
+
+class ToolAccessTag(Base):
+    """Project-level read/write tag for a tool name. Read-only agent
+    guardrails use it to decide whether an observed tool call is a breach;
+    an untagged tool is 'unknown', never silently a breach or a pass."""
+
+    __tablename__ = "tool_access_tags"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id"), nullable=False)
+    tool_name = Column(String(255), nullable=False)
+    access = Column(String(10), nullable=False, default="read")  # 'read' | 'write'
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "tool_name", name="uq_tooltag_project_tool"),
+        Index("idx_tooltags_project", "project_id"),
+    )
+
+    def __repr__(self):
+        return f"<ToolAccessTag {self.project_id} - {self.tool_name}={self.access}>"
+
+
+class DocsFeedback(Base):
+    """One "Was this page helpful?" vote from the public documentation.
+    Anonymous by design: a page path and a yes/no, nothing about the voter."""
+
+    __tablename__ = "docs_feedback"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    page = Column(String(255), nullable=False)
+    helpful = Column(Boolean, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("idx_docs_feedback_page", "page", "created_at"),)
+
+    def __repr__(self):
+        return f"<DocsFeedback {self.page} helpful={self.helpful}>"
 
 
 class InputPatternCache(Base):

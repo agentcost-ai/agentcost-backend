@@ -7,6 +7,67 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — guardrail compliance
+
+- **Declared tool boundaries per agent, judged against observed usage.** An
+  `AgentGuardrail` row records, per project and agent, whether the agent is
+  read-only and which tools it may call (`allowed_tools`, or null for any). A
+  `ToolAccessTag` row classifies a tool name as `read` or `write`, so read-only
+  can be judged without an allow-list per agent. `GET /v1/guardrails/compliance`
+  compares the declarations with the tools that actually appeared in events over
+  a window and reports, per agent, tracked tool calls, observed tools, breaches
+  (`undeclared_tool` or `write_in_readonly`, with call counts and last-seen) and a
+  `no_guardrail` / `compliant` / `breach` status. Untagged tools under a read-only
+  guardrail are listed as `unknown_access_tools`, not counted as breaches. This
+  is deliberately separate from success rate: that measures whether calls raised,
+  this measures whether agents stayed inside the boundary that was set.
+  Declarations are edited with `PUT` / `DELETE /v1/projects/{id}/guardrails[/{agent}]`
+  and `…/guardrails/tool-tags[/{tool}]`, gated on project-edit permission; reads
+  accept the project API key or a JWT.
+
+- **Model and per-run boundaries.** A guardrail can also carry `allowed_models`
+  (judged on every call's `model`, instrumented or not) and per-run limits,
+  `max_tool_calls_per_run` and `max_cost_per_run_usd`, judged over calls that
+  share a `trace_id`. Compliance reports `observed_models`, `runs_seen`, and
+  breaches of kind `undeclared_model`, `tool_calls_over_limit` and
+  `run_cost_over_limit`. A breach is `{kind, subject, count, limit, observed,
+  last_seen}`, where `subject` is the tool, the model, or the worst run's
+  `trace_id`. Existing databases gain the three columns through the post-ship
+  column migration.
+
+- **Compliance detail.** Each agent row now carries what a person needs to set
+  a boundary rather than guess one: `total_cost`, `tool_usage` (calls, last seen,
+  tag and breach kind per tool), `model_usage` (calls, cost and whether permitted
+  per model), `run_stats` (p50 / p95 / max tool calls and cost per run, computed
+  for every agent with runs so limits can be suggested before any are declared)
+  and `breach_series` (breaching calls or runs per day across the window).
+  Percentiles are nearest-rank over one row per run; for a very long window on
+  a very busy agent that is one row per run in memory — noted under known gaps.
+
+- **Breach alerts.** Every accepted batch is checked against the project's
+  guardrails after it is stored. A breach raises a `guardrail_breach` notification
+  for the owner and accepted admins (critical for a write by a read-only agent,
+  warning for an unpermitted tool) and dispatches a signed `guardrail.breach`
+  webhook where one is configured. Per-run limits are judged on the run's stored
+  totals, so a limit crossed across batches still alerts. Repeats of the same
+  (agent, subject, kind) are suppressed for an hour, so a looping agent produces one alert rather than one
+  per call. Alerting is best-effort and never delays or fails ingestion.
+
+- **`idx_events_tool`** on `(project_id, tool_name, timestamp)`, added through
+  the post-ship index migration, so compliance and the `tool` dimension do not
+  scan the events table.
+
+- Guardrail and tool-tag rows are removed with their project and on account
+  deletion.
+
+### Added — docs feedback
+
+- **`POST /v1/docs/feedback`** records the "Was this page helpful?" vote from the
+  public documentation: a `/docs/...` page path and a yes/no, nothing about the
+  voter (no account, address, cookie or user agent is stored). Anonymous by
+  design; the path is validated against the docs namespace. Votes are summarised
+  per page by `GET /v1/admin/docs-feedback` for the admin control plane.
+
 ### Fixed — pricing catalogue integrity (Aug 2026 sync audit)
 
 - **First-party listings now beat reseller medians.** With two same-priced
@@ -175,6 +236,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Testing
 
+- 22 further tests: guardrail upsert and idempotent re-upsert, breach
+  classification (tools, models, per-run limits), compliance over a window, breach notifications and webhook
+  dispatch with the one-hour dedupe, project-delete cleanup, the authenticated
+  HTTP round trip, and docs-feedback recording, validation and summary.
 - 74 new tests: cache pricing, capability guard, external correlation (including the
   concurrent-replay race), dimensions and egress, webhook configuration and delivery
   guards, cache analytics, the air-gapped pricing import, and migration rehearsals on
@@ -201,6 +266,11 @@ Not addressed in this release; see `docs/ARCHITECTURE.md` §13.
   channel.
 - No dashboard UI for budget-state, dimension analytics or webhook configuration.
 - No durable telemetry spool, no OTLP export.
+- Guardrail breaches are alerted, not enforced: the offending event is stored and
+  the batch is accepted. Compliance is computed per request over the window; there
+  is no cached rollup, and run statistics load one aggregated row per run.
+- A tool called outside `track_costs.tool()` (or on an SDK older than 0.2.2)
+  carries no `tool_name` and is invisible to compliance.
 
 ### Verification
 
