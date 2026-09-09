@@ -11,6 +11,8 @@ from typing import Optional, Literal
 
 from ..database import get_db
 from ..models.schemas import (
+    AgentDetail,
+    AgentSummary,
     AnalyticsOverview,
     AnalyticsResponse,
     AgentStats,
@@ -21,7 +23,9 @@ from ..models.schemas import (
     CacheAnalytics,
 )
 from ..models.db_models import Project
+from ..services.agent_service import AgentInsightService
 from ..services.analytics_service import AnalyticsService
+from ..services.guardrail_service import GuardrailService
 from ..services.report_service import ReportService
 from ..services.trace_service import TraceService
 from ..utils.auth import validate_project_access
@@ -87,11 +91,50 @@ async def get_agent_stats(
     return await analytics.get_agent_stats(project.id, start_time, end_time, limit)
 
 
+@router.get("/agents/summary", response_model=list[AgentSummary])
+async def get_agent_summaries(
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """
+    Per-agent cost, change against the previous window, model mix, cache
+    economics, failed-call spend, repeated work and one computed signal each.
+    The Agents page reads this instead of /agents.
+    """
+    start_time, end_time = parse_time_range(range)
+    compliance = await GuardrailService(db).compliance(project.id, start_time, end_time)
+    return await AgentInsightService(db).summaries(
+        project.id,
+        start_time,
+        end_time,
+        limit=limit,
+        compliance={a.agent_name: a for a in compliance.agents},
+    )
+
+
+@router.get("/agents/{agent_name}", response_model=AgentDetail)
+async def get_agent_detail(
+    agent_name: str,
+    range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """Everything the agent page shows for one agent, in one response."""
+    start_time, end_time = parse_time_range(range)
+    detail = await AgentInsightService(db).detail(project.id, start_time, end_time, agent_name)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="No events for this agent in the window")
+    return detail
+
+
 @router.get("/by/{dimension}", response_model=list[DimensionStat])
 async def get_dimension_stats(
     dimension: Literal["user", "session", "workflow", "tool", "model", "agent"],
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
     limit: int = Query(50, ge=1, le=500),
+    agent_name: Optional[str] = Query(None, description="Restrict to one agent"),
     db: AsyncSession = Depends(get_db),
     project: Project = Depends(validate_project_access),
 ):
@@ -110,7 +153,7 @@ async def get_dimension_stats(
 
     analytics = AnalyticsService(db)
     return await analytics.get_dimension_stats(
-        project.id, dimension, start_time, end_time, limit
+        project.id, dimension, start_time, end_time, limit, agent_name=agent_name
     )
 
 
@@ -155,6 +198,7 @@ async def get_model_stats(
 async def get_timeseries(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
     granularity: Literal["hour", "day"] = Query("day", description="Granularity: hour, day"),
+    agent_name: Optional[str] = Query(None, description="Restrict to one agent"),
     db: AsyncSession = Depends(get_db),
     project: Project = Depends(validate_project_access),
 ):
@@ -166,7 +210,7 @@ async def get_timeseries(
     start_time, end_time = parse_time_range(range)
     
     analytics = AnalyticsService(db)
-    return await analytics.get_timeseries(project.id, start_time, end_time, granularity)
+    return await analytics.get_timeseries(project.id, start_time, end_time, granularity, agent_name=agent_name)
 
 
 def _first_of_month(now: datetime) -> datetime:
@@ -263,6 +307,7 @@ async def get_full_analytics(
 @router.get("/workflows")
 async def get_workflow_stats(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    agent_name: Optional[str] = Query(None, description="Restrict to one agent"),
     limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     project: Project = Depends(validate_project_access),
@@ -270,13 +315,14 @@ async def get_workflow_stats(
     """Cost per workflow, including the average cost of a single run."""
     start_time, end_time = parse_time_range(range)
     return await TraceService(db).get_workflow_stats(
-        project.id, start_time, end_time, limit=limit
+        project.id, start_time, end_time, limit=limit, agent_name=agent_name
     )
 
 
 @router.get("/workflows/steps")
 async def get_step_stats(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    agent_name: Optional[str] = Query(None, description="Restrict to one agent"),
     workflow: Optional[str] = Query(None, description="Restrict to one workflow"),
     limit: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
@@ -285,13 +331,14 @@ async def get_step_stats(
     """Cost per step. calls_per_run above 1 indicates retries or a loop."""
     start_time, end_time = parse_time_range(range)
     return await TraceService(db).get_step_stats(
-        project.id, start_time, end_time, workflow=workflow, limit=limit
+        project.id, start_time, end_time, workflow=workflow, limit=limit, agent_name=agent_name
     )
 
 
 @router.get("/workflows/tools")
 async def get_tool_stats(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    agent_name: Optional[str] = Query(None, description="Restrict to one agent"),
     limit: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
     project: Project = Depends(validate_project_access),
@@ -299,13 +346,14 @@ async def get_tool_stats(
     """LLM spend incurred underneath each named tool."""
     start_time, end_time = parse_time_range(range)
     return await TraceService(db).get_tool_stats(
-        project.id, start_time, end_time, limit=limit
+        project.id, start_time, end_time, limit=limit, agent_name=agent_name
     )
 
 
 @router.get("/workflows/repeated-work")
 async def get_repeated_work(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    agent_name: Optional[str] = Query(None, description="Restrict to one agent"),
     limit: int = Query(25, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     project: Project = Depends(validate_project_access),
@@ -313,13 +361,14 @@ async def get_repeated_work(
     """Identical calls repeated within a single run, and what they cost."""
     start_time, end_time = parse_time_range(range)
     return await TraceService(db).detect_repeated_work(
-        project.id, start_time, end_time, limit=limit
+        project.id, start_time, end_time, limit=limit, agent_name=agent_name
     )
 
 
 @router.get("/workflows/outcomes")
 async def get_outcome_stats(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    agent_name: Optional[str] = Query(None, description="Restrict to one agent"),
     limit: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     project: Project = Depends(validate_project_access),
@@ -327,13 +376,14 @@ async def get_outcome_stats(
     """Cost per completed outcome. Requires track_costs.outcome() in the run."""
     start_time, end_time = parse_time_range(range)
     return await TraceService(db).get_outcome_stats(
-        project.id, start_time, end_time, limit=limit
+        project.id, start_time, end_time, limit=limit, agent_name=agent_name
     )
 
 
 @router.get("/workflows/distribution")
 async def get_run_cost_distribution(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    agent_name: Optional[str] = Query(None, description="Restrict to one agent"),
     workflow: Optional[str] = Query(None, description="Defaults to the highest-spend workflow"),
     buckets: int = Query(24, ge=6, le=60),
     db: AsyncSession = Depends(get_db),
@@ -349,20 +399,21 @@ async def get_run_cost_distribution(
     service = TraceService(db)
 
     target = workflow
-    if target is None:
+    if target is None and agent_name is None:
         ranked = await service.get_workflow_stats(project.id, start_time, end_time, limit=1)
         if not ranked:
             return None
         target = ranked[0]["workflow"]
 
     return await service.get_run_cost_distribution(
-        project.id, start_time, end_time, workflow=target, buckets=buckets
+        project.id, start_time, end_time, workflow=target, buckets=buckets, agent_name=agent_name
     )
 
 
 @router.get("/traces")
 async def list_traces(
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d"),
+    agent_name: Optional[str] = Query(None, description="Restrict to one agent"),
     workflow: Optional[str] = Query(None),
     limit: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
@@ -371,7 +422,7 @@ async def list_traces(
     """Individual runs, most expensive first."""
     start_time, end_time = parse_time_range(range)
     return await TraceService(db).list_traces(
-        project.id, start_time, end_time, workflow=workflow, limit=limit
+        project.id, start_time, end_time, workflow=workflow, limit=limit, agent_name=agent_name
     )
 
 

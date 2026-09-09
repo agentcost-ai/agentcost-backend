@@ -1008,3 +1008,98 @@ class DocsFeedbackSummary(BaseModel):
     pages: List[DocsFeedbackPageSummary]
     total_votes: int
     votes_last_30d: int
+
+
+# ── Agent insights (Agents list + agent detail page) ─────────────────────
+
+class AgentModelShare(BaseModel):
+    model: str
+    calls: int
+    cost: float
+    cached_share: Optional[float] = None
+
+
+class AgentDailyPoint(BaseModel):
+    day: str
+    cost: float
+    calls: int
+    failed_cost: float
+
+
+class AgentSignal(BaseModel):
+    """The one most expensive thing we can prove about an agent in the window."""
+
+    kind: Literal["breach", "repeated_work", "failed_spend", "untraced", "classification", "none"]
+    title: str
+    detail: Optional[str] = None
+    amount: Optional[float] = None
+
+
+class AgentSummary(BaseModel):
+    agent_name: str
+    total_calls: int
+    total_tokens: int
+    total_cost: float
+    avg_latency_ms: float
+    success_rate: float
+    share_percent: float
+    previous_cost: float
+    cost_change_percent: Optional[float]
+    models: List[AgentModelShare]
+    runs: int
+    cost_per_run: Optional[float]
+    calls_per_run: Optional[float]
+    cached_share: Optional[float]
+    cache_savings: float
+    failed_calls: int
+    failed_cost: float
+    repeated_cost: float
+    repeated_runs: int
+    developers: int
+    sessions: int
+    first_seen: Optional[datetime]
+    last_seen: Optional[datetime]
+    daily: List[AgentDailyPoint]
+    signal: AgentSignal
+
+
+class AgentStepCost(BaseModel):
+    step_name: str
+    tool: bool
+    models: List[str]
+    runs: int
+    calls: int
+    calls_per_run: float
+    max_calls_per_run: int
+    total_cost: float
+    median_cost_per_run: float
+    p95_cost_per_run: float
+    success_rate: float
+
+
+class AgentOutcomes(BaseModel):
+    runs: int
+    succeeded: int
+    failed: int
+    unknown: int
+    cost_on_success: float
+    cost_on_failure: float
+    cost_per_success: Optional[float]
+    success_rate: Optional[float]
+
+
+class AgentDetail(BaseModel):
+    summary: AgentSummary
+    latency: LatencyPercentiles
+    steps: List[AgentStepCost]
+    by_model: List[DimensionStat]
+    by_tool: List[DimensionStat]
+    by_user: List[DimensionStat]
+    by_session: List[DimensionStat]
+    by_workflow: List[DimensionStat]
+    distribution: Optional[Dict[str, Any]]
+    tail_cost: float
+    repeated_work: List[Dict[str, Any]]
+    traces: List[Dict[str, Any]]
+    outcomes: Optional[AgentOutcomes]
+    compliance: Optional[AgentCompliance]

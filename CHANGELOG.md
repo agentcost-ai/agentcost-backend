@@ -7,6 +7,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — agent insights
+
+- **`GET /v1/analytics/agents/summary`.** Per agent over the window: cost and
+  its change against the previous window of the same length, share of project
+  spend, the models used with cached-input share, distinct traced runs with cost
+  and calls per run, cached-token share and cache savings priced per model,
+  failed calls and the cost they still billed, identical calls repeated inside
+  one run priced as waste, distinct developers and sessions, first and last seen,
+  a daily series, and one computed `signal` — the most expensive thing the data
+  proves: a guardrail breach, repeated work above 5% of spend, failed spend above
+  2%, a classification workload (≥100 calls, output never above 16 tokens), or
+  an untraced agent.
+- **`GET /v1/analytics/agents/{agent_name}`.** The summary row plus exact latency
+  percentiles, per-step median and p95 cost per run, spend by model, tool,
+  developer, session and workflow, the run-cost distribution and the tail's
+  spend, repeated-work findings, the most expensive runs, declared outcomes
+  folded into one figure, and the agent's guardrail compliance record. 404 when
+  the agent made no calls in the window.
+- **`agent_name` filter** on `/v1/analytics/timeseries`, `/v1/analytics/by/{dimension}`,
+  `/v1/analytics/workflows`, `/workflows/steps`, `/workflows/tools`,
+  `/workflows/repeated-work`, `/workflows/outcomes`, `/workflows/distribution`
+  and `/v1/analytics/traces`. With an agent given, `distribution` no longer
+  defaults to the top workflow; it spans every run of that agent.
+
+
 ### Added — guardrail compliance
 
 - **Declared tool boundaries per agent, judged against observed usage.** An

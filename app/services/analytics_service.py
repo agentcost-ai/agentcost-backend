@@ -169,6 +169,7 @@ class AnalyticsService:
         start_time: datetime,
         end_time: datetime,
         limit: int = 50,
+        agent_name: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Cost and volume grouped by one dimension.
 
@@ -188,6 +189,15 @@ class AnalyticsService:
                 f"Expected one of: {', '.join(sorted(self.GROUPABLE_DIMENSIONS))}."
             )
 
+        filters = [
+            Event.project_id == project_id,
+            Event.timestamp >= start_time,
+            Event.timestamp <= end_time,
+            column.isnot(None),
+        ]
+        if agent_name:
+            filters.append(Event.agent_name == agent_name)
+
         query = select(
             column.label("key"),
             func.count(Event.id).label("total_calls"),
@@ -195,12 +205,7 @@ class AnalyticsService:
             func.sum(Event.cost).label("total_cost"),
             func.avg(Event.latency_ms).label("avg_latency"),
             func.sum(case((Event.success == True, 1), else_=0)).label("success_count"),  # noqa: E712
-        ).where(
-            Event.project_id == project_id,
-            Event.timestamp >= start_time,
-            Event.timestamp <= end_time,
-            column.isnot(None),
-        ).group_by(column).order_by(func.sum(Event.cost).desc()).limit(limit)
+        ).where(*filters).group_by(column).order_by(func.sum(Event.cost).desc()).limit(limit)
 
         rows = []
         for row in await self.db.execute(query):
@@ -399,6 +404,7 @@ class AnalyticsService:
         start_time: datetime,
         end_time: datetime,
         granularity: str = "hour",  # hour, day
+        agent_name: Optional[str] = None,
     ) -> List[TimeSeriesPoint]:
         """
         Get time series data.
@@ -423,17 +429,21 @@ class AnalyticsService:
             else:
                 time_bucket = func.date_trunc('hour', ts)
 
+        filters = [
+            Event.project_id == project_id,
+            Event.timestamp >= start_time,
+            Event.timestamp <= end_time,
+        ]
+        if agent_name:
+            filters.append(Event.agent_name == agent_name)
+
         query = select(
             time_bucket.label('time_bucket'),
             func.count(Event.id).label('calls'),
             func.sum(Event.total_tokens).label('tokens'),
             func.sum(Event.cost).label('cost'),
             func.avg(Event.latency_ms).label('avg_latency'),
-        ).where(
-            Event.project_id == project_id,
-            Event.timestamp >= start_time,
-            Event.timestamp <= end_time,
-        ).group_by(
+        ).where(*filters).group_by(
             time_bucket
         ).order_by(
             time_bucket

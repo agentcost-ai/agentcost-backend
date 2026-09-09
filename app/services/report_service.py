@@ -15,7 +15,7 @@ services don't already expose are computed here with new queries.
 import logging
 import math
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
 from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -203,17 +203,27 @@ class ReportService:
 
     # ── Latency percentiles (only section needing raw rows) ───────────────
 
+    async def latency_percentiles(
+        self, project_id: str, start: datetime, end: datetime, agent_name: Optional[str] = None
+    ) -> LatencyPercentiles:
+        """Public entry for other services: the agent page reuses the exact
+        percentiles instead of re-implementing the dialect split."""
+        return await self._latency(project_id, start, end, agent_name)
+
     async def _latency(
-        self, project_id: str, start: datetime, end: datetime
+        self, project_id: str, start: datetime, end: datetime, agent_name: Optional[str] = None
     ) -> LatencyPercentiles:
         """Exact p50/p95/p99 over every call in the window, computed in the
         database rather than over a capped sample of rows."""
-        where_clause = (
+        where_clause = [
             Event.project_id == project_id,
             Event.timestamp >= start,
             Event.timestamp <= end,
             Event.latency_ms.isnot(None),
-        )
+        ]
+        if agent_name:
+            where_clause.append(Event.agent_name == agent_name)
+        where_clause = tuple(where_clause)
 
         is_postgres = self._dialect == "postgresql"
 

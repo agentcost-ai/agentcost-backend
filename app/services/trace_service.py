@@ -24,20 +24,30 @@ class TraceService:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    def _scoped(self, project_id: str, start_time: datetime, end_time: datetime):
+    def _scoped(
+        self,
+        project_id: str,
+        start_time: datetime,
+        end_time: datetime,
+        agent_name: Optional[str] = None,
+    ):
         """The filter every trace query shares."""
-        return (
+        filters = [
             Event.project_id == project_id,
             Event.timestamp >= start_time,
             Event.timestamp <= end_time,
             Event.trace_id.isnot(None),
-        )
+        ]
+        if agent_name:
+            filters.append(Event.agent_name == agent_name)
+        return tuple(filters)
 
     async def get_workflow_stats(
         self,
         project_id: str,
         start_time: datetime,
         end_time: datetime,
+        agent_name: Optional[str] = None,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
         """
@@ -59,7 +69,7 @@ class TraceService:
                 func.min(Event.timestamp).label("started_at"),
                 func.max(Event.timestamp).label("ended_at"),
             )
-            .where(*self._scoped(project_id, start_time, end_time))
+            .where(*self._scoped(project_id, start_time, end_time, agent_name))
             .group_by(Event.workflow, Event.trace_id)
             .subquery()
         )
@@ -115,6 +125,7 @@ class TraceService:
         project_id: str,
         start_time: datetime,
         end_time: datetime,
+        agent_name: Optional[str] = None,
         workflow: Optional[str] = None,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
@@ -124,7 +135,7 @@ class TraceService:
         ``calls`` far exceeding ``runs`` means the step executed repeatedly
         inside single runs -- a retry or a loop.
         """
-        filters = list(self._scoped(project_id, start_time, end_time))
+        filters = list(self._scoped(project_id, start_time, end_time, agent_name))
         filters.append(Event.step_name.isnot(None))
         if workflow:
             filters.append(Event.workflow == workflow)
@@ -176,10 +187,11 @@ class TraceService:
         project_id: str,
         start_time: datetime,
         end_time: datetime,
+        agent_name: Optional[str] = None,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
         """LLM spend incurred underneath each named tool."""
-        filters = list(self._scoped(project_id, start_time, end_time))
+        filters = list(self._scoped(project_id, start_time, end_time, agent_name))
         filters.append(Event.tool_name.isnot(None))
 
         query = (
@@ -215,6 +227,7 @@ class TraceService:
         project_id: str,
         start_time: datetime,
         end_time: datetime,
+        agent_name: Optional[str] = None,
         limit: int = 25,
     ) -> List[Dict[str, Any]]:
         """
@@ -224,7 +237,7 @@ class TraceService:
         that argues for a cache, this usually means the control flow is wrong.
         ``wasted_cost`` covers every occurrence beyond the first.
         """
-        filters = list(self._scoped(project_id, start_time, end_time))
+        filters = list(self._scoped(project_id, start_time, end_time, agent_name))
         filters.append(Event.input_hash.isnot(None))
 
         query = (
@@ -283,6 +296,7 @@ class TraceService:
         project_id: str,
         start_time: datetime,
         end_time: datetime,
+        agent_name: Optional[str] = None,
         workflow: Optional[str] = None,
         buckets: int = 24,
     ) -> Optional[Dict[str, Any]]:
@@ -293,7 +307,7 @@ class TraceService:
         of spend consumed by the most expensive 5% of runs; when it is large,
         the fix is bounding the tail rather than shaving the median.
         """
-        filters = list(self._scoped(project_id, start_time, end_time))
+        filters = list(self._scoped(project_id, start_time, end_time, agent_name))
         if workflow:
             filters.append(Event.workflow == workflow)
 
@@ -414,6 +428,7 @@ class TraceService:
         project_id: str,
         start_time: datetime,
         end_time: datetime,
+        agent_name: Optional[str] = None,
         limit: int = 20,
     ) -> List[Dict[str, Any]]:
         """
@@ -429,7 +444,7 @@ class TraceService:
                 Event.workflow.label("workflow"),
                 func.sum(Event.cost).label("cost"),
             )
-            .where(*self._scoped(project_id, start_time, end_time))
+            .where(*self._scoped(project_id, start_time, end_time, agent_name))
             .group_by(Event.trace_id, Event.workflow)
             .subquery()
         )
@@ -569,11 +584,12 @@ class TraceService:
         project_id: str,
         start_time: datetime,
         end_time: datetime,
+        agent_name: Optional[str] = None,
         workflow: Optional[str] = None,
         limit: int = 50,
     ) -> List[Dict[str, Any]]:
         """Recent runs, most expensive first."""
-        filters = list(self._scoped(project_id, start_time, end_time))
+        filters = list(self._scoped(project_id, start_time, end_time, agent_name))
         if workflow:
             filters.append(Event.workflow == workflow)
 
