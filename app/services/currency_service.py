@@ -49,6 +49,8 @@ class CurrencyService:
 
     # currency -> (rate, fetched_unix_ts)
     _cache: dict[str, tuple[float, float]] = {}
+    # currency -> where its cached rate came from: live provider or fallback table.
+    _source: dict[str, str] = {}
     _lock = asyncio.Lock()
     # In-flight background refreshes, kept referenced so they aren't GC'd.
     _refresh_tasks: dict[str, asyncio.Task] = {}
@@ -142,6 +144,7 @@ class CurrencyService:
                     payload = response.json()
                     live_rate = float(payload["rates"][target])
                     cls._cache[target] = (live_rate, time.time())
+                    cls._source[target] = "frankfurter.dev"
                     return live_rate
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -153,7 +156,18 @@ class CurrencyService:
                 # Cache fallback briefly so we don't hammer the network on
                 # repeated failures, but with a short TTL so we retry soon.
                 cls._cache[target] = (fallback, time.time() - _CACHE_TTL_SECONDS + 300)
+                cls._source[target] = "fallback"
                 return fallback
+
+    @classmethod
+    def source_for(cls, currency: str | None) -> str:
+        """Where the rate we would hand out came from: the live provider, the
+        static fallback table, or exact (USD to USD). Lets the UI say
+        "approximate" instead of presenting a fallback as live."""
+        target = cls.normalize(currency)
+        if target == "USD":
+            return "exact"
+        return cls._source.get(target, "fallback")
 
     @classmethod
     async def usd_to(cls, currency: str | None) -> float:

@@ -39,7 +39,8 @@ async def get_fx_rate(
     Return the cached USD -> ``target`` exchange rate.
 
     Always returns 1.0 when ``target=USD``. Falls back to a sensible static
-    rate if the upstream FX provider is unreachable.
+    rate if the upstream FX provider is unreachable; ``source`` says which
+    (``frankfurter.dev``, ``fallback`` or ``exact``).
     """
     normalized = CurrencyService.normalize(target)
     if target.upper().strip() not in SUPPORTED_CURRENCIES:
@@ -52,4 +53,6 @@ async def get_fx_rate(
         )
 
     rate = await CurrencyService.usd_to(normalized)
-    return FxRateResponse(target=normalized, rate=rate)
+    return FxRateResponse(
+        target=normalized, rate=rate, source=CurrencyService.source_for(normalized)
+    )

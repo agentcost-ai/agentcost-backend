@@ -165,33 +165,42 @@ class AgentInsightService:
         ).all()
 
         # Identical input repeated inside one run: the redundant occurrences
-        # are waste. Same definition as TraceService.detect_repeated_work.
+        # are waste. Same definition as TraceService.detect_repeated_work, but
+        # folded per agent in SQL so a busy 90-day window never streams every
+        # duplicate group into Python.
+        groups = (
+            select(
+                Event.agent_name.label("agent_name"),
+                Event.trace_id.label("trace_id"),
+                func.count(Event.id).label("occurrences"),
+                func.sum(Event.cost).label("spend"),
+            )
+            .where(
+                *window,
+                Event.agent_name.in_(names),
+                Event.trace_id.isnot(None),
+                Event.input_hash.isnot(None),
+            )
+            .group_by(Event.agent_name, Event.trace_id, Event.step_name, Event.input_hash, Event.model)
+            .having(func.count(Event.id) > 1)
+            .subquery()
+        )
         repeated_rows = (
             await self.db.execute(
                 select(
-                    Event.agent_name,
-                    Event.trace_id,
-                    func.count(Event.id).label("occurrences"),
-                    func.sum(Event.cost).label("spend"),
-                )
-                .where(
-                    *window,
-                    Event.agent_name.in_(names),
-                    Event.trace_id.isnot(None),
-                    Event.input_hash.isnot(None),
-                )
-                .group_by(Event.agent_name, Event.trace_id, Event.step_name, Event.input_hash, Event.model)
-                .having(func.count(Event.id) > 1)
+                    groups.c.agent_name,
+                    # spend * (n - 1) / n per group: everything beyond the first call.
+                    func.sum(groups.c.spend - groups.c.spend / groups.c.occurrences).label("wasted"),
+                    func.count(func.distinct(groups.c.trace_id)).label("runs"),
+                ).group_by(groups.c.agent_name)
             )
         ).all()
 
         repeated_cost: Dict[str, float] = {}
-        repeated_runs: Dict[str, set] = {}
+        repeated_runs: Dict[str, int] = {}
         for row in repeated_rows:
-            n = int(row.occurrences or 0)
-            spend = float(row.spend or 0.0)
-            repeated_cost[row.agent_name] = repeated_cost.get(row.agent_name, 0.0) + spend * (n - 1) / n
-            repeated_runs.setdefault(row.agent_name, set()).add(row.trace_id)
+            repeated_cost[row.agent_name] = float(row.wasted or 0.0)
+            repeated_runs[row.agent_name] = int(row.runs or 0)
 
         # Cache economics, priced per model the way ingest prices them.
         models: Dict[str, List[AgentModelShare]] = {}
@@ -256,7 +265,7 @@ class AgentInsightService:
             runs = int(row.runs or 0)
             prev = previous.get(name, 0.0)
             rep_cost = repeated_cost.get(name, 0.0)
-            rep_runs = len(repeated_runs.get(name, ()))
+            rep_runs = repeated_runs.get(name, 0)
             inputs = input_tokens.get(name, 0)
             cached = cached_tokens.get(name, 0)
             agent_models = sorted(models.get(name, []), key=lambda m: m.cost, reverse=True)
