@@ -523,6 +523,11 @@ class TraceService:
 
         Flat with parent ids rather than pre-nested, so an event whose parent
         never arrived cannot break the response.
+
+        Carries the run's outcome when one was reported. A run that ended
+        before any model call -- refused or blocked by an external control
+        plane -- has an outcome and no events, and is still a run: it comes
+        back with zero spans rather than as not found.
         """
         query = (
             select(Event)
@@ -532,8 +537,29 @@ class TraceService:
         result = await self.db.execute(query)
         events = result.scalars().all()
 
-        if not events:
+        outcome_row = (
+            await self.db.execute(
+                select(TraceOutcome).where(
+                    TraceOutcome.project_id == project_id,
+                    TraceOutcome.trace_id == trace_id,
+                )
+            )
+        ).scalar_one_or_none()
+
+        if not events and outcome_row is None:
             return None
+
+        outcome = (
+            {
+                "success": outcome_row.success,
+                "label": outcome_row.label,
+                "recorded_at": (
+                    outcome_row.recorded_at.isoformat() if outcome_row.recorded_at else None
+                ),
+            }
+            if outcome_row is not None
+            else None
+        )
 
         spans = [
             {
@@ -563,7 +589,11 @@ class TraceService:
 
         return {
             "trace_id": trace_id,
-            "workflow": events[0].workflow,
+            "workflow": (
+                events[0].workflow if events else None
+            ) or (outcome_row.workflow if outcome_row is not None else None),
+            # None when no outcome was reported: unknown, not failed.
+            "outcome": outcome,
             "total_cost": round(total_cost, 6),
             "total_calls": len(spans),
             "total_tokens": sum(int(e.total_tokens or 0) for e in events),

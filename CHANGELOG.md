@@ -7,6 +7,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — outcome on the run
+
+- **`GET /v1/analytics/traces/{trace_id}` returns `outcome`.** How the run
+  ended — `success`, `label`, `recorded_at` — or `null` when none was reported.
+  The integration guide already described this; the endpoint now does it.
+- **A run with an outcome and no events is found.** A run an external control
+  plane refused before any inference used to be a 404. It now returns with
+  zero calls, an empty `spans` and its outcome, so a denied run can be read
+  back by the id that denied it.
+
 ### Added — agent insights
 
 - **`GET /v1/analytics/agents/summary`.** Per agent over the window: cost and

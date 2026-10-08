@@ -170,6 +170,66 @@ class TestOutcomeOnlyBatches:
         assert rows[0].label == "final"
 
 
+class TestOutcomeOnTheRun:
+    """The joined view: one read returns a run's cost and how it ended."""
+
+    async def test_run_detail_carries_the_reported_outcome(self, client, test_project):
+        run_id = str(uuid.uuid4())
+        await client.post(
+            "/v1/events/batch",
+            json={
+                "project_id": test_project.id,
+                "events": [_event(trace_id=run_id, workflow="refactor-run", step_name="plan")],
+                "outcomes": [
+                    {"trace_id": run_id, "workflow": "refactor-run", "success": False, "label": "blocked:loopguard"}
+                ],
+            },
+        )
+
+        detail = (await client.get(f"/v1/analytics/traces/{run_id}")).json()
+        assert detail["total_calls"] == 1
+        assert detail["outcome"]["success"] is False
+        assert detail["outcome"]["label"] == "blocked:loopguard"
+        assert detail["outcome"]["recorded_at"]
+
+    async def test_a_run_with_no_reported_outcome_is_unknown_not_failed(self, client, test_project):
+        run_id = str(uuid.uuid4())
+        await client.post(
+            "/v1/events/batch",
+            json={"project_id": test_project.id, "events": [_event(trace_id=run_id)]},
+        )
+
+        detail = (await client.get(f"/v1/analytics/traces/{run_id}")).json()
+        assert detail["outcome"] is None
+
+    async def test_a_run_refused_before_any_call_is_still_found(self, client, test_project):
+        """A denial produces an outcome and no events; that is a run, not a 404."""
+        run_id = str(uuid.uuid4())
+        await client.post(
+            "/v1/events/batch",
+            json={
+                "project_id": test_project.id,
+                "outcomes": [
+                    {"trace_id": run_id, "workflow": "refactor-run", "success": False, "label": "refused:preflight"}
+                ],
+            },
+        )
+
+        response = await client.get(f"/v1/analytics/traces/{run_id}")
+        assert response.status_code == 200, response.text
+        detail = response.json()
+        assert detail["workflow"] == "refactor-run"
+        assert detail["outcome"]["label"] == "refused:preflight"
+        assert detail["spans"] == []
+        assert detail["total_calls"] == 0
+        assert detail["total_cost"] == 0
+        assert detail["duration_ms"] is None
+
+    async def test_an_unknown_run_is_still_not_found(self, client, test_project):
+        response = await client.get(f"/v1/analytics/traces/{uuid.uuid4()}")
+        assert response.status_code == 404
+
+
 class TestIdempotency:
     async def test_replayed_event_id_is_not_stored_twice(
         self, client, test_project, test_session

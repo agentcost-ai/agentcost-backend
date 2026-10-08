@@ -432,7 +432,11 @@ async def get_trace_detail(
     db: AsyncSession = Depends(get_db),
     project: Project = Depends(validate_project_access),
 ):
-    """Every span of one run, ordered as it executed."""
+    """Every span of one run, ordered as it executed, and how the run ended.
+
+    `outcome` is null when none was reported. A run with an outcome and no
+    events -- refused before any model call -- is returned with zero spans.
+    """
     detail = await TraceService(db).get_trace_detail(project.id, trace_id)
     if detail is None:
         raise HTTPException(status_code=404, detail="Trace not found")

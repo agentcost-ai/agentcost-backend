@@ -206,7 +206,22 @@ curl -H "Authorization: Bearer $KEY" \
   https://api.agentcost.tech/v1/analytics/traces/0532f9c4-a022-4e98-a543-d8e17c5b90a6
 ```
 
-Returns every call in the run, its position in the tree, its cost, and the outcome.
+Returns every call in the run, its position in the tree, its cost, and the outcome:
+
+```json
+{
+  "trace_id": "0532f9c4-a022-4e98-a543-d8e17c5b90a6",
+  "workflow": "refactor-run",
+  "total_cost": 0.0412,
+  "total_calls": 3,
+  "outcome": { "success": false, "label": "denied:postgres.query", "recorded_at": "2026-08-13T09:14:02+00:00" },
+  "spans": [ ... ]
+}
+```
+
+`outcome` is `null` when none was reported — unknown, not failed. A run that was denied
+before any inference has an outcome and no events; it is returned with `total_calls: 0`
+and an empty `spans`, not as a 404.
 
 ### Ordering caveat
 
