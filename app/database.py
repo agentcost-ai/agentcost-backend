@@ -251,6 +251,8 @@ _DESIRED_COLUMNS = {
         # _backfill_dimensions promotes historical rows when these are added.
         "user_id":    {"type": "VARCHAR(255)"},
         "session_id": {"type": "VARCHAR(255)"},
+        # 'api' or 'subscription'; NULL = unstated, treated as metered.
+        "billing":    {"type": "VARCHAR(20)"},
     },
     "model_pricing": {
         # Context/input cap, distinct from max_tokens (the output cap).

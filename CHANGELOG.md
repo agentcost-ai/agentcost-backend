@@ -7,6 +7,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added — policy for enforcement points
+
+- **`GET /v1/guardrails/policy`.** The project's enabled guardrails, tool tags
+  and budget position in one read, authenticated with the project API key. For
+  something that sits in front of the call and can refuse it; the SDK's
+  coding-agent gate (`agentcost connect --enforce`) is the first consumer.
+
+### Added — subscription usage is not spend
+
+- **`metadata.billing` is read at ingest.** `subscription` marks a call covered
+  by a flat plan, as a coding agent on a Claude or ChatGPT plan is; `api` marks
+  metered usage. Promoted to an indexed `events.billing` column. Anything else,
+  or nothing, is stored as unstated and treated as metered.
+- **Budgets count metered spend only.** A subscription row's cost is what the
+  usage is worth at API rates, not money owed, so it is left out of
+  month-to-date spend, threshold alerts, `budget-state` and the hard cap.
+- **`GET /v1/analytics/overview` returns `subscription_cost`**, the part of
+  `total_cost` covered by a plan. `total_cost` minus it is metered spend.
+- **`GET /v1/analytics/by/billing`** groups cost by how it was paid for.
+
 ### Added — outcome on the run
 
 - **`GET /v1/analytics/traces/{trace_id}` returns `outcome`.** How the run

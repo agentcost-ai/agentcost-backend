@@ -131,7 +131,7 @@ async def get_agent_detail(
 
 @router.get("/by/{dimension}", response_model=list[DimensionStat])
 async def get_dimension_stats(
-    dimension: Literal["user", "session", "workflow", "tool", "model", "agent"],
+    dimension: Literal["user", "session", "workflow", "tool", "model", "agent", "billing"],
     range: Literal["1h", "24h", "7d", "30d", "90d"] = Query("7d", description="Time range: 1h, 24h, 7d, 30d, 90d"),
     limit: int = Query(50, ge=1, le=500),
     agent_name: Optional[str] = Query(None, description="Restrict to one agent"),

@@ -50,6 +50,9 @@ class AnalyticsService:
             func.sum(Event.input_tokens).label('total_input_tokens'),
             func.sum(Event.output_tokens).label('total_output_tokens'),
             func.sum(Event.cost).label('total_cost'),
+            func.sum(
+                case((Event.billing == "subscription", Event.cost), else_=0.0)
+            ).label('subscription_cost'),
             func.avg(Event.latency_ms).label('avg_latency'),
             func.sum(case((Event.success == True, 1), else_=0)).label('success_count'),
         ).where(
@@ -57,10 +60,10 @@ class AnalyticsService:
             Event.timestamp >= start_time,
             Event.timestamp <= end_time,
         )
-        
+
         result = await self.db.execute(query)
         row = result.one()
-        
+
         # Convert Decimal values to int/float for arithmetic operations
         total_calls = int(row.total_calls) if row.total_calls is not None else 0
         total_tokens = int(row.total_tokens) if row.total_tokens is not None else 0
@@ -78,6 +81,7 @@ class AnalyticsService:
         
         return AnalyticsOverview(
             total_cost=round(total_cost, 6),
+            subscription_cost=round(float(row.subscription_cost or 0.0), 6),
             total_calls=total_calls,
             total_tokens=total_tokens,
             total_input_tokens=total_input_tokens,
@@ -160,6 +164,7 @@ class AnalyticsService:
         "tool": Event.tool_name,
         "model": Event.model,
         "agent": Event.agent_name,
+        "billing": Event.billing,
     }
 
     async def get_dimension_stats(

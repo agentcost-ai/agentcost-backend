@@ -105,6 +105,13 @@ class Event(Base):
     # metadata keys the SDK documents -- user_id and session_id.
     user_id = Column(String(255), nullable=True)
     session_id = Column(String(255), nullable=True)
+
+    # How the call is paid for: 'api' (metered per token) or 'subscription'
+    # (covered by a flat plan, as coding agents usually are). NULL means the
+    # client did not say, and is treated as metered. A subscription row's cost
+    # is what the usage is worth at API rates, not money owed, so budgets
+    # leave it out.
+    billing = Column(String(20), nullable=True)
     
     # Hash of normalized input for caching pattern detection
     input_hash = Column(String(64), nullable=True)

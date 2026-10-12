@@ -271,6 +271,9 @@ class AnalyticsOverview(BaseModel):
     """Overview analytics response"""
     
     total_cost: float
+    # The part of total_cost covered by a flat subscription: what that usage is
+    # worth at API rates, not money owed. total_cost minus this is metered spend.
+    subscription_cost: float = 0.0
     total_calls: int
     total_tokens: int
     total_input_tokens: int = 0
@@ -875,6 +878,16 @@ class GuardrailResponse(BaseModel):
     updated_at: Optional[datetime]
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class EnforcementPolicy(BaseModel):
+    """Everything an enforcement point needs to decide locally, in one read."""
+
+    guardrails: List[GuardrailResponse]
+    # tool name -> read | write
+    tool_tags: Dict[str, str]
+    budget: ProjectBudgetState
+    as_of: str
 
 
 class ToolAccessTagUpsert(BaseModel):
