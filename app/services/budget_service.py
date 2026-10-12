@@ -81,6 +81,9 @@ class BudgetService:
                 Event.project_id == project_id,
                 Event.timestamp >= start,
                 Event.timestamp < end,
+                # A budget is money. Usage covered by a subscription has a
+                # value at API rates but is not spend, so it never counts.
+                Event.billing.is_distinct_from("subscription"),
             )
         )
         return float(result.scalar() or 0.0)

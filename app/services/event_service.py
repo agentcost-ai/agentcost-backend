@@ -35,6 +35,53 @@ def _dimension(metadata: Optional[dict], key: str) -> Optional[str]:
     return text[:_DIMENSION_MAX] if text else None
 
 
+_BILLING_MODES = ("api", "subscription")
+
+
+def _billing(metadata: Optional[dict]) -> Optional[str]:
+    """How the call is paid for, when the client stated it in a known form."""
+    value = _dimension(metadata, "billing")
+    return value if value in _BILLING_MODES else None
+
+
+def _one_hour_writes(event: EventCreate, pricing: Optional[dict]) -> int:
+    """How many of a call's cache-write tokens were written for one hour.
+
+    They cost 2x the input rate rather than the catalogue's five-minute rate,
+    and Claude Code writes its cache that way, so pricing them all at the
+    five-minute rate understates a write-heavy call by more than a third.
+    """
+    written = event.cache_write_tokens or 0
+    if not written:
+        return 0
+
+    stated = (event.metadata or {}).get("cache_write_1h_tokens")
+    if isinstance(stated, int) and not isinstance(stated, bool):
+        return max(0, min(stated, written))
+
+    # Not stated: Claude Code's OpenTelemetry export carries one cache-write
+    # count. Its own cost figure says which lifetime it was billed at, so take
+    # whichever reading lands closer to it. The cost stored is still computed
+    # here from the catalogue, never copied from the client.
+    claimed = float(event.cost or 0.0)
+    if claimed <= 0:
+        return 0
+    usage = dict(
+        input_tokens=event.input_tokens,
+        output_tokens=event.output_tokens,
+        cached_tokens=event.cached_tokens or 0,
+        cache_write_tokens=written,
+    )
+    five_minute = price_event(pricing, **usage)
+    one_hour = price_event(pricing, **usage, cache_write_1h_tokens=written)
+    return written if abs(one_hour - claimed) < abs(five_minute - claimed) else 0
+
+
+def is_metered(row: Event) -> bool:
+    """Whether a row's cost is money owed rather than plan usage at API rates."""
+    return row.billing != "subscription"
+
+
 @dataclass
 class PreparedBatch:
     """Priced, not-yet-persisted events plus the aggregates they imply.
@@ -49,9 +96,15 @@ class PreparedBatch:
     # (agent_name, input_hash) -> (occurrences, summed cost)
     pattern_counts: Dict[Tuple[str, str], Tuple[int, float]] = field(default_factory=dict)
     total_cost: float = 0.0
+    # The part of total_cost that is metered spend -- what a budget counts.
+    metered_cost: float = 0.0
     # Events skipped because their event_id was already stored. Reported back
     # so a client can tell "your retry was a no-op" from "your event vanished".
     duplicates: int = 0
+
+
+def _metered_cost(rows: List[Event]) -> float:
+    return round(sum(row.cost for row in rows if is_metered(row)), _COST_PRECISION)
 
 
 class EventService:
@@ -134,6 +187,7 @@ class EventService:
                     output_tokens=event_data.output_tokens,
                     cached_tokens=event_data.cached_tokens or 0,
                     cache_write_tokens=event_data.cache_write_tokens or 0,
+                    cache_write_1h_tokens=_one_hour_writes(event_data, pricing),
                 )
 
                 # Use server cost when available; fall back to SDK-provided cost.
@@ -172,6 +226,7 @@ class EventService:
                     extra_data=event_data.metadata,
                     user_id=_dimension(event_data.metadata, "user_id"),
                     session_id=_dimension(event_data.metadata, "session_id"),
+                    billing=_billing(event_data.metadata),
                     input_hash=event_data.input_hash,
                     event_id=event_data.event_id,
                     trace_id=event_data.trace_id,
@@ -199,6 +254,7 @@ class EventService:
             rows=db_events,
             pattern_counts=pattern_counts,
             total_cost=round(total_cost, _COST_PRECISION),
+            metered_cost=_metered_cost(db_events),
             duplicates=duplicates,
         )
 
@@ -274,6 +330,7 @@ class EventService:
                 pattern_counts[key] = (occurrences + 1, summed + row.cost)
         prepared.pattern_counts = pattern_counts
         prepared.total_cost = round(total_cost, _COST_PRECISION)
+        prepared.metered_cost = _metered_cost(surviving)
 
     async def persist_outcomes(
         self, project_id: str, outcomes: List[OutcomeCreate]

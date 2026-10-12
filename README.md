@@ -106,7 +106,7 @@ agentcost-backend/
 | GET    | `/v1/analytics/overview`   | Cost overview (total, calls, tokens) |
 | GET    | `/v1/analytics/agents`     | Per-agent breakdown                  |
 | GET    | `/v1/analytics/models`     | Per-model breakdown                  |
-| GET    | `/v1/analytics/by/{dim}`   | Grouped by user, session, workflow, tool, model or agent |
+| GET    | `/v1/analytics/by/{dim}`   | Grouped by user, session, workflow, tool, model, agent or billing |
 | GET    | `/v1/analytics/cache`      | Prompt-cache hit rate and savings    |
 | GET    | `/v1/analytics/timeseries` | Time series data                     |
 | GET    | `/v1/analytics/full`       | Complete analytics response          |

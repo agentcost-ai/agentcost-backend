@@ -219,7 +219,9 @@ class ReportService:
             Event.project_id == project_id,
             Event.timestamp >= start,
             Event.timestamp <= end,
-            Event.latency_ms.isnot(None),
+            # 0 is how a call with no measured latency is stored (a coding
+            # agent read from its session log): unknown, not instant.
+            Event.latency_ms > 0,
         ]
         if agent_name:
             where_clause.append(Event.agent_name == agent_name)
@@ -229,7 +231,7 @@ class ReportService:
 
         base_q = select(
             func.count(Event.id).label("n"),
-            func.avg(Event.latency_ms).label("avg"),
+            func.avg(func.nullif(Event.latency_ms, 0)).label("avg"),
         ).where(*where_clause)
 
         if is_postgres:

@@ -20,7 +20,9 @@ from ..models.schemas import (
     GuardrailComplianceResponse,
     ToolAccessTagUpsert,
     ToolAccessTagResponse,
+    EnforcementPolicy,
 )
+from ..services.budget_service import BudgetService
 from ..services.guardrail_service import GuardrailService
 from ..services.permission_service import PermissionService, Permission
 from ..utils.auth import validate_project_access, get_required_user
@@ -46,6 +48,28 @@ async def list_guardrails(
 ):
     """Declared guardrails for every agent in the project."""
     return await GuardrailService(db).list_guardrails(project.id)
+
+
+@router.get("/v1/guardrails/policy", response_model=EnforcementPolicy)
+async def enforcement_policy(
+    db: AsyncSession = Depends(get_db),
+    project: Project = Depends(validate_project_access),
+):
+    """The project's enabled guardrails, tool tags and budget position.
+
+    For something that sits where AgentCost does not -- in front of the call --
+    and so can refuse it: a coding agent's pre-tool hook, a gateway, a control
+    plane. Meant to be fetched occasionally and held; the decision itself must
+    not wait on this request. Read-only, like ``budget-state``.
+    """
+    service = GuardrailService(db)
+    budget = await BudgetService(db).budget_state(project)
+    return EnforcementPolicy(
+        guardrails=[g for g in await service.list_guardrails(project.id) if g.enabled],
+        tool_tags={tag.tool_name: tag.access for tag in await service.list_tool_tags(project.id)},
+        budget=budget,
+        as_of=budget["as_of"],
+    )
 
 
 @router.get("/v1/guardrails/compliance", response_model=GuardrailComplianceResponse)

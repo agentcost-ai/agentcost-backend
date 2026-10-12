@@ -12,6 +12,10 @@ from typing import Optional
 # fractions of a cent. Every caller rounds at this precision.
 COST_PRECISION = 8
 
+# Anthropic bills a one-hour cache write at 2x the input rate (five-minute
+# writes are 1.25x, which is the rate the catalogue carries).
+ONE_HOUR_WRITE_MULTIPLIER = 2.0
+
 
 def price_event(
     pricing: Optional[dict],
@@ -19,6 +23,7 @@ def price_event(
     output_tokens: int,
     cached_tokens: int = 0,
     cache_write_tokens: int = 0,
+    cache_write_1h_tokens: int = 0,
 ) -> float:
     """Cost in USD for one call, accounting for prompt-cache rates.
 
@@ -27,6 +32,10 @@ def price_event(
     writes are additional tokens billed at a premium (Anthropic) and are
     added on top. Where a provider publishes no cache rate the tokens fall
     back to the standard input rate — a discount is never assumed.
+
+    ``cache_write_1h_tokens`` is the part of ``cache_write_tokens`` written
+    with a one-hour lifetime, which Anthropic bills at twice the input rate.
+    The catalogue's cache-write rate is the five-minute one.
     """
     if pricing is None:
         return 0.0
@@ -41,10 +50,14 @@ def price_event(
     cached = max(0, min(cached_tokens, input_tokens))
     uncached = input_tokens - cached
 
+    written = max(0, cache_write_tokens)
+    written_1h = max(0, min(cache_write_1h_tokens, written))
+
     total = (
         (uncached / 1000) * input_rate
         + (cached / 1000) * cached_rate
-        + (max(0, cache_write_tokens) / 1000) * write_rate
+        + ((written - written_1h) / 1000) * write_rate
+        + (written_1h / 1000) * input_rate * ONE_HOUR_WRITE_MULTIPLIER
         + (output_tokens / 1000) * output_rate
     )
     return round(total, COST_PRECISION)

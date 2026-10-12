@@ -15,11 +15,13 @@ from .integrations import router as integrations_router
 from .metrics import router as metrics_router
 from .guardrails import router as guardrails_router
 from .docs_feedback import router as docs_feedback_router
+from .otlp import router as otlp_router
 
 __all__ = [
     "metrics_router",
     "guardrails_router",
     "docs_feedback_router",
+    "otlp_router",
     "events_router",
     "analytics_router",
     "projects_router",

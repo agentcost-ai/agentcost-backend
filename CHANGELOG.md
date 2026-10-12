@@ -7,6 +7,66 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed - numbers that were wrong for cache-heavy and coding-agent usage
+
+- **One-hour cache writes are priced at 2x input**, as Anthropic bills them,
+  instead of at the five-minute rate. Taken from `metadata.cache_write_1h_tokens`
+  when stated, otherwise from whichever reading the client-reported cost is
+  closer to. The stored cost is still computed from the catalogue. A write-heavy
+  Claude Code call was understated by more than a third.
+- **Unknown latency no longer drags averages down.** A latency of 0 means not
+  measured; it is excluded from latency averages and percentiles everywhere.
+- **Model-downgrade savings can no longer exceed what was spent.** The estimate
+  priced every input token at the list rate, so a workload served from the
+  prompt cache could show savings of several times its cost. It is now capped by
+  the alternative price advantage over the actual cost.
+- **Subscription usage yields no downgrade suggestions.** There is no money to
+  recover on calls a flat plan already covers.
+- **Codex over OTLP**: warm-up responses with no output are skipped, as Codex
+  skips them in its own totals; the tool a response called is attributed from
+  the `codex.tool_result` records that follow it, under the names Codex hooks
+  use; and the event id is derived from session and token counts, the same id
+  the SDK collector derives, so a machine reporting both ways is counted once.
+
+### Added — OTLP receiver for coding agents
+
+- **`POST /v1/otlp/v1/logs`.** Accepts the OpenTelemetry log export Claude Code
+  and Codex already have (OTLP over HTTP, JSON, optionally gzipped),
+  authenticated with the project API key. Each model call in it becomes one
+  event and takes the same pricing, deduplication, budget and guardrail path as
+  `/v1/events/batch`; every other record is discarded unread. Lets an
+  organisation report every session from managed settings with nothing
+  installed, including sessions that run in the cloud.
+- A Claude Code call is keyed by its API request id, the id the SDK's local
+  collector uses for the same call, so a machine reporting both ways is counted
+  once. The tool a call invoked is attributed when its decision record is in
+  the same export.
+- `agentcost.billing=subscription|api` as a resource attribute states how the
+  usage is paid for. Codex's `auth_mode` is used when it is not given.
+- `/v1/otlp/v1/metrics` and `/v1/otlp/v1/traces` accept and discard, so one
+  endpoint setting covers all three signals. Protobuf bodies are refused with a
+  415 naming the setting to change.
+
+### Added — policy for enforcement points
+
+- **`GET /v1/guardrails/policy`.** The project's enabled guardrails, tool tags
+  and budget position in one read, authenticated with the project API key. For
+  something that sits in front of the call and can refuse it; the SDK's
+  coding-agent gate (`agentcost connect --enforce`) is the first consumer.
+
+### Added — subscription usage is not spend
+
+- **`metadata.billing` is read at ingest.** `subscription` marks a call covered
+  by a flat plan, as a coding agent on a Claude or ChatGPT plan is; `api` marks
+  metered usage. Promoted to an indexed `events.billing` column. Anything else,
+  or nothing, is stored as unstated and treated as metered.
+- **Budgets count metered spend only.** A subscription row's cost is what the
+  usage is worth at API rates, not money owed, so it is left out of
+  month-to-date spend, threshold alerts, `budget-state` and the hard cap.
+- **`GET /v1/analytics/overview` returns `subscription_cost`**, the part of
+  `total_cost` covered by a plan. `total_cost` minus it is metered spend.
+- **`GET /v1/analytics/by/billing`** groups cost by how it was paid for.
+
 ### Added — outcome on the run
 
 - **`GET /v1/analytics/traces/{trace_id}` returns `outcome`.** How the run

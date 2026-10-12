@@ -194,8 +194,11 @@ class OptimizationService:
             Event.project_id == project_id,
             Event.timestamp >= start_time,
             Event.timestamp <= end_time,
+            # Only metered usage has money to recover. A cheaper model saves
+            # nothing on calls a flat subscription already covers.
+            Event.billing.is_distinct_from("subscription"),
         ).group_by(Event.model, Event.agent_name)
-        
+
         result = await self.db.execute(query)
 
         # Materialize and filter first: capability inference is then resolved for
@@ -275,7 +278,15 @@ class OptimizationService:
                 input_savings = (total_input / 1000) * savings["input_per_1k"]
                 output_savings = (total_output / 1000) * savings["output_per_1k"]
                 period_savings = input_savings + output_savings
-                
+
+                # The figure above prices every input token at the list rate.
+                # A workload served mostly from the prompt cache paid a
+                # fraction of that, so the same arithmetic can "save" several
+                # times what was actually spent. A switch cannot recover more
+                # than the alternative's price advantage over the real cost.
+                price_advantage = min(max(float(savings.get("percentage") or 0), 0.0), 100.0)
+                period_savings = min(period_savings, cost * price_advantage / 100)
+
                 if period_savings <= 0:
                     continue
                 
@@ -588,7 +599,7 @@ class OptimizationService:
         query = select(
             Event.agent_name,
             Event.model,
-            func.avg(Event.latency_ms).label("avg_latency"),
+            func.avg(func.nullif(Event.latency_ms, 0)).label("avg_latency"),
             func.avg(Event.input_tokens).label("avg_input_tokens"),
             func.count(Event.id).label("call_count"),
         ).where(
@@ -938,7 +949,7 @@ class OptimizationService:
             func.max(Event.output_tokens).label("max_output"),
             func.avg(Event.output_tokens).label("avg_output"),
             func.sum(Event.cost).label("total_cost"),
-            func.avg(Event.latency_ms).label("avg_latency"),
+            func.avg(func.nullif(Event.latency_ms, 0)).label("avg_latency"),
         ).where(
             Event.project_id == project_id,
             Event.timestamp >= start_time,

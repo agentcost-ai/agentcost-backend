@@ -89,7 +89,7 @@ class AgentInsightService:
                 func.count(Event.id).label("calls"),
                 func.sum(Event.total_tokens).label("tokens"),
                 func.sum(Event.cost).label("cost"),
-                func.avg(Event.latency_ms).label("latency"),
+                func.avg(func.nullif(Event.latency_ms, 0)).label("latency"),
                 func.sum(case((Event.success == True, 1), else_=0)).label("ok"),  # noqa: E712
                 func.sum(case((Event.success == False, 1), else_=0)).label("failed"),  # noqa: E712
                 func.sum(case((Event.success == False, Event.cost), else_=0.0)).label("failed_cost"),  # noqa: E712

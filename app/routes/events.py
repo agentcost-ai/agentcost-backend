@@ -120,7 +120,7 @@ async def ingest_events_batch(
         try:
             budget_eval = await budget_service.evaluate(
                 project,
-                additional_cost=prepared.total_cost,
+                additional_cost=prepared.metered_cost,
                 hot_path=True,
             )
         except Exception as exc:  # noqa: BLE001

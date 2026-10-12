@@ -604,3 +604,37 @@ async def test_compliance_detail_reports_usage_and_run_stats(
     assert len(agent["breach_series"]) == 1
     assert agent["breach_series"][0]["count"] == 2
     assert {b["kind"] for b in agent["breaches"]} == {"undeclared_tool", "undeclared_model"}
+
+
+@pytest.mark.asyncio
+async def test_policy_is_one_read_of_everything_enforceable(
+    client: AsyncClient, test_session, test_project
+):
+    service = GuardrailService(test_session)
+    await service.upsert_guardrail(
+        test_project.id,
+        GuardrailUpsert(
+            agent_name="claude-code",
+            allowed_tools=["Read", "Grep"],
+            max_cost_per_run_usd=5.0,
+        ),
+    )
+    await service.upsert_guardrail(
+        test_project.id, GuardrailUpsert(agent_name="paused", read_only=True, enabled=False)
+    )
+    await service.upsert_tool_tag(test_project.id, "Bash", "write")
+    test_project.monthly_budget_usd = 100.0
+    test_project.budget_enforcement_mode = "hard_cap"
+    await test_session.commit()
+
+    response = await client.get("/v1/guardrails/policy")
+
+    assert response.status_code == 200, response.text
+    policy = response.json()
+    # A disabled guardrail is not a boundary, so it is not served as one.
+    assert [g["agent_name"] for g in policy["guardrails"]] == ["claude-code"]
+    assert policy["guardrails"][0]["allowed_tools"] == ["Read", "Grep"]
+    assert policy["guardrails"][0]["max_cost_per_run_usd"] == 5.0
+    assert policy["tool_tags"] == {"Bash": "write"}
+    assert policy["budget"]["mode"] == "hard_cap"
+    assert policy["budget"]["exhausted"] is False
