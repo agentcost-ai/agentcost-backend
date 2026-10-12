@@ -28,6 +28,7 @@ from .routes import (
     metrics_router,
     guardrails_router,
     docs_feedback_router,
+    otlp_router,
 )
 from .routes.auth import router as auth_router
 from .routes.members import router as members_router
@@ -181,6 +182,11 @@ OPENAPI_TAGS = [
         "LLM call ingestion. Batched writes from the SDK, plus read-back of stored events. "
         "Authenticated with a project API key ('Authorization: Bearer sk_...')."
     )},
+    {"name": "OTLP", "description": (
+        "OpenTelemetry receiver for coding agents. Accepts the OTLP/HTTP JSON log export "
+        "Claude Code and Codex already have and stores each model call in it as an event. "
+        "Authenticated with a project API key."
+    )},
     {"name": "Analytics", "description": (
         "Aggregated spend: overview totals, per-agent and per-dimension breakdowns, "
         "time series, cache savings, workflow and trace analysis."
@@ -315,6 +321,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 app.include_router(auth_router)
 app.include_router(members_router)
 app.include_router(events_router)
+app.include_router(otlp_router)
 app.include_router(analytics_router)
 app.include_router(projects_router)
 app.include_router(optimizations_router)

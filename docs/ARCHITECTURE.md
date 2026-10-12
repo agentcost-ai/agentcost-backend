@@ -202,6 +202,29 @@ Everything else is optional.
 Ingest is split into *price it* and *write it*, so budget evaluation runs against the
 cost the server will actually store rather than the figure a client claimed.
 
+### OTLP ingest
+
+A second way in, for clients that already speak OpenTelemetry and cannot run the
+SDK. Nothing about it is new below the route: it maps log records to the same
+events and hands them to the same pipeline.
+
+```http
+POST /v1/otlp/v1/logs
+Authorization: Bearer <project_api_key>
+Content-Type: application/json
+```
+
+| Source | Record read | Notes |
+|---|---|---|
+| Claude Code | `claude_code.api_request` | `event_id` is `cc-<request_id>`, matching the SDK collector. Cache reads are folded into `input_tokens`. `tool_name` from the `tool_decision` records that precede the request in the same export. |
+| Codex | `codex.sse_event` with `event.kind = response.completed` | A response with no output is a connection warm-up and is skipped. `event_id` is derived from conversation and token counts, matching the SDK collector. `tool_name` from the `codex.tool_result` records that follow the response, named as Codex hooks name them (`Bash`, `apply_patch`). |
+
+Everything else in an export -- prompts, tool results, settings, metrics, traces --
+is dropped unread. JSON only; `Content-Encoding: gzip` is accepted, bounded by the
+request size limit after inflation. Billing mode comes from the resource attribute
+`agentcost.billing`, else Codex's `auth_mode`, else is unstated and treated as
+metered.
+
 ### Repricing
 
 Pricing for every distinct model in the batch is fetched once, not per event. Cost is
@@ -579,11 +602,12 @@ Stated plainly, because they are easier to design around than to discover.
 |---|---|
 | **Python-only tracer** | The ingest endpoint is language-agnostic, but automatic trace structure exists only in the Python SDK. A foreign emitter gets cost without run shape unless it populates the span fields itself. |
 | **At-most-once delivery** | Telemetry buffers in memory only. A hard process kill loses it. No durable spool yet. |
+| **Latency is not always known** | A call read from a coding agent session log has no latency. It is stored as 0 and left out of every latency average and percentile; an average of 0 means none of the calls in the window carried one. |
 | **Analytics read raw events** | A daily rollup table exists in the schema but is not yet populated; queries scan the events table. Fine into the low millions of rows, not beyond. |
 | **Budget cap blocks ingest, not spend** | Hitting the hard cap returns 429 on *telemetry*. AgentCost is not in the inference path and cannot stop the underlying calls. Enforcement has to live somewhere that is. |
-| **No OTLP export** | Prometheus and webhooks are supported; OpenTelemetry traces are not exported yet. |
+| **No OTLP export** | Prometheus and webhooks are supported; OpenTelemetry traces are not exported yet. OTLP is accepted on the way in (logs from Claude Code and Codex), not emitted. |
 | **Structured-output workloads are not rehomed** | The catalogue has no per-model JSON-mode flag, so a workload known to require structured output gets no downgrade suggestions. |
-| **Anthropic 1-hour cache writes are under-priced** | LiteLLM publishes only the 5-minute-TTL write rate; 1-hour-TTL writes bill at 2× standard input upstream but are priced here at the 5-minute rate. Splitting by TTL needs a per-TTL breakdown end to end. |
+| **One-hour cache writes need a hint** | The catalogue carries only the five-minute cache-write rate. One-hour writes are priced at 2x input when the event says how many there were (`metadata.cache_write_1h_tokens`, sent by the coding-agent collector) or, failing that, when the client-reported cost is closer to the one-hour reading (Claude Code over OTLP). An event with neither is priced at the five-minute rate. |
 | **Token totals exclude Anthropic cache writes** | `input_tokens` is normalised to prompt = uncached + cache reads; cache-write tokens are priced but not counted in `total_tokens`, so token analytics run slightly low on write-heavy calls. Cost is unaffected. |
 | **Guardrails observe, they do not block** | A breach is stored, alerted and reported; the call already happened. The exception is a coding agent connected with `agentcost connect --enforce`: its pre-tool hook reads `GET /v1/guardrails/policy` and refuses the call before it runs. Compliance is computed per request over the window (no rollup), and only calls made inside `track_costs.tool()` on SDK ≥ 0.2.2 carry a `tool_name`, and per-run limits only see calls inside `track_costs.workflow()` — anything else is invisible to them. Model boundaries see every call. |
 | **Webhook delivery refuses private addresses** | The delivery-time SSRF guard resolves the host and refuses non-public addresses. Local listeners (including the `http://localhost` development exception) require `WEBHOOK_ALLOW_PRIVATE_URLS=true` in the server environment. |

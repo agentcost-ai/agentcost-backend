@@ -82,7 +82,7 @@ class BaselineService:
             func.avg(Event.cost).label('avg_cost'),
             func.avg(Event.input_tokens).label('avg_input'),
             func.avg(Event.output_tokens).label('avg_output'),
-            func.avg(Event.latency_ms).label('avg_latency'),
+            func.avg(func.nullif(Event.latency_ms, 0)).label('avg_latency'),
             # Standard deviations using SQL. See sql_dialect.stddev_pop for why
             # this is not the inline sqrt(avg(x*x) - avg(x)*avg(x)) it used to be.
             func.coalesce(stddev_pop(Event.cost, dialect), 0).label('stddev_cost'),
@@ -297,7 +297,7 @@ class BaselineService:
             Event.model,
             func.count(Event.id).label('call_count'),
             func.avg(Event.cost).label('avg_cost'),
-            func.avg(Event.latency_ms).label('avg_latency'),
+            func.avg(func.nullif(Event.latency_ms, 0)).label('avg_latency'),
             func.avg(Event.input_tokens).label('avg_input'),
             func.avg(Event.output_tokens).label('avg_output'),
             func.sum(case((Event.success == False, 1), else_=0)).label('error_count'),

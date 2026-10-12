@@ -148,7 +148,7 @@ class TraceService:
                 func.count(func.distinct(Event.trace_id)).label("runs"),
                 func.sum(Event.cost).label("total_cost"),
                 func.sum(Event.total_tokens).label("total_tokens"),
-                func.avg(Event.latency_ms).label("avg_latency"),
+                func.avg(func.nullif(Event.latency_ms, 0)).label("avg_latency"),
                 func.sum(case((Event.success == False, 1), else_=0)).label("failures"),  # noqa: E712
             )
             .where(*filters)
@@ -201,7 +201,7 @@ class TraceService:
                 func.count(func.distinct(Event.trace_id)).label("runs"),
                 func.sum(Event.cost).label("total_cost"),
                 func.sum(Event.total_tokens).label("total_tokens"),
-                func.avg(Event.latency_ms).label("avg_latency"),
+                func.avg(func.nullif(Event.latency_ms, 0)).label("avg_latency"),
             )
             .where(*filters)
             .group_by(Event.tool_name)

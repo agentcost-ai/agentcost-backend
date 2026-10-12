@@ -88,7 +88,7 @@ async def prometheus_metrics(
                 func.coalesce(func.sum(Event.cost), 0.0),
                 func.coalesce(func.sum(Event.total_tokens), 0),
                 func.coalesce(func.sum(Event.cached_tokens), 0),
-                func.coalesce(func.avg(Event.latency_ms), 0.0),
+                func.coalesce(func.avg(func.nullif(Event.latency_ms, 0)), 0.0),
                 func.coalesce(
                     func.sum(case((Event.success == False, 1), else_=0)), 0  # noqa: E712
                 ),

@@ -53,7 +53,7 @@ class AnalyticsService:
             func.sum(
                 case((Event.billing == "subscription", Event.cost), else_=0.0)
             ).label('subscription_cost'),
-            func.avg(Event.latency_ms).label('avg_latency'),
+            func.avg(func.nullif(Event.latency_ms, 0)).label('avg_latency'),
             func.sum(case((Event.success == True, 1), else_=0)).label('success_count'),
         ).where(
             Event.project_id == project_id,
@@ -118,7 +118,7 @@ class AnalyticsService:
             func.count(Event.id).label('total_calls'),
             func.sum(Event.total_tokens).label('total_tokens'),
             func.sum(Event.cost).label('total_cost'),
-            func.avg(Event.latency_ms).label('avg_latency'),
+            func.avg(func.nullif(Event.latency_ms, 0)).label('avg_latency'),
             func.sum(case((Event.success == True, 1), else_=0)).label('success_count'),
         ).where(
             Event.project_id == project_id,
@@ -208,7 +208,7 @@ class AnalyticsService:
             func.count(Event.id).label("total_calls"),
             func.sum(Event.total_tokens).label("total_tokens"),
             func.sum(Event.cost).label("total_cost"),
-            func.avg(Event.latency_ms).label("avg_latency"),
+            func.avg(func.nullif(Event.latency_ms, 0)).label("avg_latency"),
             func.sum(case((Event.success == True, 1), else_=0)).label("success_count"),  # noqa: E712
         ).where(*filters).group_by(column).order_by(func.sum(Event.cost).desc()).limit(limit)
 
@@ -356,7 +356,7 @@ class AnalyticsService:
             func.sum(Event.input_tokens).label('input_tokens'),
             func.sum(Event.output_tokens).label('output_tokens'),
             func.sum(Event.cost).label('total_cost'),
-            func.avg(Event.latency_ms).label('avg_latency'),
+            func.avg(func.nullif(Event.latency_ms, 0)).label('avg_latency'),
         ).where(
             Event.project_id == project_id,
             Event.timestamp >= start_time,
@@ -447,7 +447,7 @@ class AnalyticsService:
             func.count(Event.id).label('calls'),
             func.sum(Event.total_tokens).label('tokens'),
             func.sum(Event.cost).label('cost'),
-            func.avg(Event.latency_ms).label('avg_latency'),
+            func.avg(func.nullif(Event.latency_ms, 0)).label('avg_latency'),
         ).where(*filters).group_by(
             time_bucket
         ).order_by(
