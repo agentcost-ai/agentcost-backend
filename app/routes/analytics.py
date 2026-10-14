@@ -5,6 +5,7 @@ Endpoints for analytics queries.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from ..utils.client_time import local_hour, local_midnight, local_month_start, use_client_timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Literal
@@ -30,7 +31,11 @@ from ..services.report_service import ReportService
 from ..services.trace_service import TraceService
 from ..utils.auth import validate_project_access
 
-router = APIRouter(prefix="/v1/analytics", tags=["Analytics"])
+router = APIRouter(
+    prefix="/v1/analytics",
+    tags=["Analytics"],
+    dependencies=[Depends(use_client_timezone)],
+)
 
 
 def parse_time_range(range_str: str) -> tuple[datetime, datetime]:
@@ -39,19 +44,17 @@ def parse_time_range(range_str: str) -> tuple[datetime, datetime]:
     now = datetime.now(timezone.utc)
     end_time = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
 
+    # Day ranges start at midnight and 24h starts on the hour, on the viewer's
+    # clock (see client_time). A window measured back to the minute began part
+    # way through its first bucket, so that bucket shrank and the total moved
+    # on every refresh. Now only the current day or hour is still filling.
+    days = {"7d": 7, "30d": 30, "90d": 90}.get(range_str)
     if range_str == "1h":
         start_time = end_time - timedelta(hours=1)
     elif range_str == "24h":
-        start_time = end_time - timedelta(hours=24)
-    elif range_str == "7d":
-        start_time = end_time - timedelta(days=7)
-    elif range_str == "30d":
-        start_time = end_time - timedelta(days=30)
-    elif range_str == "90d":
-        start_time = end_time - timedelta(days=90)
+        start_time = local_hour(now) - timedelta(hours=23)
     else:
-        # Default to 7 days
-        start_time = end_time - timedelta(days=7)
+        start_time = local_midnight(now) - timedelta(days=(days or 7) - 1)
     
     return start_time, end_time
 
@@ -214,7 +217,7 @@ async def get_timeseries(
 
 
 def _first_of_month(now: datetime) -> datetime:
-    return datetime(now.year, now.month, 1, tzinfo=timezone.utc)
+    return local_month_start(now)
 
 
 @router.get("/report", response_model=ExecutiveReport)

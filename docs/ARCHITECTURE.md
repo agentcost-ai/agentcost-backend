@@ -193,6 +193,7 @@ Everything else is optional.
 | Partial validation | Malformed events are dropped **individually** and echoed in `rejected[]`; the batch still returns 200. One bad event never blocks a queue. |
 | Idempotency | Optional `event_id`, unique per project. A replay returns 200 with `events_duplicate` incremented and stores nothing. |
 | Outcome-only batches | `events` may be empty or omitted when `outcomes` is present. Outcomes upsert on `trace_id`; last write wins. |
+| Session names | Optional `sessions: [{session_id, name}]`, also allowed on its own. Upserts on `session_id`; last write wins. Returned as `name` wherever a session or run is listed. Sent only by clients that opted in, since a chat title summarises what was asked. |
 | Backpressure | 429 when a project's monthly budget hard cap is reached |
 
 ---
@@ -279,6 +280,7 @@ logged with a per-model diff.
 |---|---|
 | **Baselines** | Per `(agent, model)` mean and standard deviation of cost/call, tokens, latency, daily volume, error rate. Anomaly thresholds derived from the project's own distribution, not hardcoded. |
 | **Optimizer** | Six suggestion classes: model downgrade, caching, prompt, batching, error reduction, latency. Plus non-LLM candidates — classifier-shaped workloads that need no model, detected on *maximum* output tokens rather than average, since an average hides the tenth of calls that write prose. |
+| **Session habits** | For coding agents (`workflow` of `claude-code`, `codex` or `antigravity`), where the user controls neither prompt nor model: share of usage spent on very long contexts, prompt-cache rebuilds mid-session, one session dominating, and requests refused at the plan limit. Served with the optimizer suggestions as `session_*` types, as a share of usage with no dollar saving. |
 | **Alternative learning** | Candidate swaps ranked by price similarity, re-ranked by whether users implemented or dismissed them. Each carries `source` (learned vs dynamic) and a confidence score. |
 | **Trace analytics** | Per workflow, step and tool cost; repeated-work detection within a run; run cost distribution; outcome stats including cost-per-success and spend-on-failures. |
 | **Executive report** | KPIs with period deltas, latency percentiles, Pareto cost concentration, token efficiency, error breakdown, run-rate projection, budget status. |

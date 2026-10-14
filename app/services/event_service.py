@@ -383,6 +383,55 @@ class EventService:
         await self.db.flush()
         return written
 
+    async def persist_session_names(self, project_id: str, sessions: list) -> int:
+        """Upsert session names. Caller's transaction owns the commit.
+
+        A title can change as a chat goes on, so the last one sent wins.
+        """
+        from ..models.db_models import SessionName
+
+        if not sessions:
+            return 0
+
+        latest = {s.session_id: s.name for s in sessions}
+        existing_rows = await self.db.execute(
+            select(SessionName).where(
+                SessionName.project_id == project_id,
+                SessionName.session_id.in_(list(latest)),
+            )
+        )
+        existing = {row.session_id: row for row in existing_rows.scalars().all()}
+
+        now = datetime.now(timezone.utc)
+        for session_id, name in latest.items():
+            row = existing.get(session_id)
+            if row is None:
+                self.db.add(
+                    SessionName(
+                        project_id=project_id, session_id=session_id, name=name, updated_at=now
+                    )
+                )
+            elif row.name != name:
+                row.name, row.updated_at = name, now
+
+        await self.db.flush()
+        return len(latest)
+
+    async def session_names(self, project_id: str, session_ids) -> Dict[str, str]:
+        """Names for the given sessions (or runs), for the ones that have one."""
+        from ..models.db_models import SessionName
+
+        wanted = [s for s in set(session_ids) if s]
+        if not wanted:
+            return {}
+        rows = await self.db.execute(
+            select(SessionName.session_id, SessionName.name).where(
+                SessionName.project_id == project_id,
+                SessionName.session_id.in_(wanted),
+            )
+        )
+        return {session_id: name for session_id, name in rows}
+
     async def get_events(
         self,
         project_id: str,

@@ -40,7 +40,7 @@ from ..models.schemas import (
     SavingsRollup,
     ExecutiveReport,
 )
-from ..utils.sql_dialect import dialect_name, utc_timestamp
+from ..utils.sql_dialect import dialect_name, local_timestamp
 from .analytics_service import AnalyticsService
 from .budget_service import BudgetService
 from .optimization_service import OptimizationService
@@ -373,7 +373,7 @@ class ReportService:
         # Bucket in UTC to match the UTC window bounds: extract() on a
         # ``timestamptz`` otherwise answers in the session TimeZone, which moves
         # "busiest hour" (and, at the edges, "busiest day") by the server offset.
-        ts = utc_timestamp(self._dialect)
+        ts = local_timestamp(self._dialect)
         if self._dialect == "sqlite":
             dow_expr = func.strftime("%w", ts)
             hour_expr = func.strftime("%H", ts)

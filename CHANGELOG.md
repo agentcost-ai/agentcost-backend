@@ -7,6 +7,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed - daily figures that moved
+
+- **Day ranges start at midnight, 24h on the hour.** "Last 7 days" was measured
+  back to the minute, so its first day was a fraction that shrank on every
+  refresh and the total moved with it. A day range is now today plus the
+  previous whole days; only the current day (or hour) is still filling.
+- **Days are the viewer's days.** Analytics read `X-Timezone-Offset` (minutes
+  east of UTC) and cut days and hours at the viewer's midnight: the timeseries,
+  agent daily spend, guardrail breach series, report cadence and month to date.
+  Before, a viewer in India saw anything done before 5:30 am on the previous
+  day. Without the header everything stays in UTC.
+
+### Added - session habits: optimizer advice for coding agents
+
+- **`GET /v1/optimizations` now covers coding agents.** The existing analyses
+  assume you control the prompt and the model; in Claude Code or Codex you
+  control only how you use sessions. Four new suggestion types say where that
+  usage goes: `session_large_context` (share of usage spent on calls with over
+  200K tokens of context), `session_cache_rebuild` (the prompt cache rewritten
+  mid-session, as when an old session is resumed after a break),
+  `session_dominant` (one session taking 40% or more) and `session_rate_limited`
+  (requests refused at the plan limit).
+- They carry a share of usage in `metrics.headline_value`, not a saving:
+  `estimated_savings_monthly` is 0, so they never add to recoverable spend.
+  Reported only for an agent with at least 20 calls and $1 of usage in the window.
+
+### Added - session names
+
+- **`sessions` on `POST /v1/events/batch`.** A list of `{session_id, name}`,
+  upserted with the last name winning, and allowed in a batch of its own. Sent
+  by coding-agent clients that opted in to sharing chat titles.
+- **`name` on sessions and runs.** `GET /v1/analytics/by/session`,
+  `GET /v1/analytics/traces`, `GET /v1/analytics/traces/{trace_id}` and the
+  agent detail endpoint return the session's name, or null when none was shared.
+
 ### Fixed - numbers that were wrong for cache-heavy and coding-agent usage
 
 - **One-hour cache writes are priced at 2x input**, as Anthropic bills them,

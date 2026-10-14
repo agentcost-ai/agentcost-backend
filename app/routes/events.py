@@ -83,6 +83,7 @@ async def ingest_events_batch(
             events_rejected=len(request.rejected),
             events_duplicate=duplicates,
             outcomes_recorded=outcomes,
+            sessions_named=sessions_named,
             # Enough to debug with, without echoing a whole junk batch back.
             rejected=request.rejected[:10],
         )
@@ -101,6 +102,14 @@ async def ingest_events_batch(
         )
     except Exception as exc:
         raise _ingest_failed("recording outcomes", exc) from exc
+
+    # Names are independent of the events too, and usually arrive on their own.
+    try:
+        sessions_named = await event_service.persist_session_names(
+            project.id, request.sessions
+        )
+    except Exception as exc:
+        raise _ingest_failed("recording session names", exc) from exc
 
     if not request.events:
         return _response(0, outcomes_written)

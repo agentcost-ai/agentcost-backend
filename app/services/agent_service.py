@@ -26,7 +26,7 @@ from ..models.schemas import (
     AgentSummary,
     DimensionStat,
 )
-from ..utils.sql_dialect import dialect_name, utc_timestamp
+from ..utils.sql_dialect import dialect_name, local_timestamp
 from .analytics_service import AnalyticsService
 from .guardrail_service import GuardrailService, describe_breach
 from .pricing_service import PricingService
@@ -148,7 +148,7 @@ class AgentInsightService:
             )
         ).all()
 
-        day = func.date(utc_timestamp(self._dialect)).label("day")
+        day = func.date(local_timestamp(self._dialect)).label("day")
         daily_rows = (
             await self.db.execute(
                 select(

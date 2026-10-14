@@ -587,8 +587,13 @@ class TraceService:
         started = min((e.timestamp for e in events if e.timestamp), default=None)
         ended = max((e.timestamp for e in events if e.timestamp), default=None)
 
+        from .event_service import EventService
+
         return {
             "trace_id": trace_id,
+            "name": (await EventService(self.db).session_names(project_id, [trace_id])).get(
+                trace_id
+            ),
             "workflow": (
                 events[0].workflow if events else None
             ) or (outcome_row.workflow if outcome_row is not None else None),
@@ -648,6 +653,7 @@ class TraceService:
             traces.append(
                 {
                     "trace_id": row.trace_id,
+                    "name": None,
                     "workflow": row.workflow,
                     "calls": int(row.calls or 0),
                     "total_cost": round(float(row.total_cost or 0.0), 6),
@@ -662,4 +668,13 @@ class TraceService:
                     ),
                 }
             )
+
+        # A coding agent's run is a session, and may have been given a name.
+        from .event_service import EventService
+
+        names = await EventService(self.db).session_names(
+            project_id, [trace["trace_id"] for trace in traces]
+        )
+        for trace in traces:
+            trace["name"] = names.get(trace["trace_id"])
         return traces

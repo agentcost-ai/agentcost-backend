@@ -26,9 +26,10 @@ from ..services.budget_service import BudgetService
 from ..services.guardrail_service import GuardrailService
 from ..services.permission_service import PermissionService, Permission
 from ..utils.auth import validate_project_access, get_required_user
+from ..utils.client_time import use_client_timezone
 from .analytics import parse_time_range
 
-router = APIRouter(tags=["Guardrails"])
+router = APIRouter(tags=["Guardrails"], dependencies=[Depends(use_client_timezone)])
 
 
 async def _require_edit(db: AsyncSession, user: User, project_id: str) -> None:

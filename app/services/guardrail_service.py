@@ -24,6 +24,7 @@ from ..models.db_models import (
     Notification,
 )
 from ..models.user_models import User, ProjectMember, UserRole
+from ..utils.sql_dialect import dialect_name, local_timestamp
 from . import webhook_service
 from .notification_service import NotificationService
 from ..models.schemas import (
@@ -239,7 +240,7 @@ class GuardrailService:
             Event.timestamp >= start_time,
             Event.timestamp <= end_time,
         )
-        day = func.date(Event.timestamp).label("day")
+        day = func.date(local_timestamp(dialect_name(self.db))).label("day")
 
         # Tool usage per agent and per day (only calls wrapped in track_costs.tool()).
         tools_daily = (

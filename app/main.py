@@ -265,7 +265,8 @@ app.add_middleware(
     allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-API-Key", "Accept"],
+    # X-Timezone-Offset: the dashboard's clock, so days are the viewer's days.
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "Accept", "X-Timezone-Offset"],
     # Without this a browser client cannot read its own remaining quota --
     # cross-origin JS only sees the CORS-safelisted response headers.
     expose_headers=[

@@ -124,6 +124,21 @@ class OutcomeCreate(BaseModel):
     label: Optional[str] = Field(None, max_length=255)
 
 
+class SessionNameCreate(BaseModel):
+    """What a session is called. Sent only by clients configured to share it."""
+
+    session_id: str = Field(..., min_length=1, max_length=255)
+    name: str = Field(..., min_length=1, max_length=255)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _one_tidy_line(cls, value):
+        # A title is one line. Cut rather than reject: a long one is still a name.
+        if isinstance(value, str):
+            return " ".join(value.split())[:255]
+        return value
+
+
 class EventBatchRequest(BaseModel):
     """Request body for batch event ingestion
 
@@ -141,6 +156,11 @@ class EventBatchRequest(BaseModel):
     )
     # Absent from older SDKs, and from any batch whose runs declared none.
     outcomes: List[OutcomeCreate] = Field(
+        default_factory=list, max_length=_MAX_EVENTS_PER_BATCH
+    )
+    # Names for sessions, from clients that opted in to sending them. Like an
+    # outcome, a name can arrive in a batch of its own.
+    sessions: List[SessionNameCreate] = Field(
         default_factory=list, max_length=_MAX_EVENTS_PER_BATCH
     )
 
@@ -180,9 +200,9 @@ class EventBatchRequest(BaseModel):
             # An outcome-only batch is legitimate: a control plane that ends a
             # run by denying it produced no LLM call of its own, but still has
             # the most important thing to say about that run.
-            if data.get("outcomes"):
+            if data.get("outcomes") or data.get("sessions"):
                 return handler({**data, "events": []})
-            raise ValueError("A batch must carry at least one event or outcome.")
+            raise ValueError("A batch must carry at least one event, outcome or session name.")
         if not isinstance(raw, list):
             return handler(data)  # wrong type entirely — let field validation say so
 
@@ -228,6 +248,7 @@ class EventBatchResponse(BaseModel):
     # exists. Distinct from rejected: a duplicate is a successful no-op.
     events_duplicate: int = 0
     outcomes_recorded: int = 0
+    sessions_named: int = 0
     rejected: List[RejectedEvent] = Field(default_factory=list)
 
 
@@ -573,6 +594,9 @@ class DimensionStat(BaseModel):
     """Aggregates for one value of a grouping dimension."""
 
     key: str
+    # For the session dimension: what the session is called, if the client
+    # shared it. Null everywhere else.
+    name: Optional[str] = None
     total_calls: int
     total_tokens: int
     total_cost: float

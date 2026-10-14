@@ -128,7 +128,15 @@ class OptimizationService:
             project_id, start_time, end_time, days
         )
         suggestions.extend(classifier_suggestions)
-        
+
+        # Coding agents: what the analyses above cannot say, because there the
+        # user controls neither the prompt nor the model, only their sessions.
+        from .session_habit_service import SessionHabitService
+
+        suggestions.extend(
+            await SessionHabitService(self.db).analyze(project_id, start_time, end_time)
+        )
+
         if not include_low_priority:
             suggestions = [s for s in suggestions if s.get("priority") != "low"]
         

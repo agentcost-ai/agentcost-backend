@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from ..models.db_models import Event
-from ..utils.sql_dialect import as_utc_datetime, dialect_name, utc_timestamp
+from ..utils.sql_dialect import dialect_name, local_bucket_instant, local_timestamp
 from ..models.schemas import (
     AnalyticsOverview,
     AgentStats,
@@ -226,6 +226,15 @@ class AnalyticsService:
                     (success_count / total_calls * 100) if total_calls else 100.0, 2
                 ),
             })
+
+        if dimension == "session" and rows:
+            from .event_service import EventService
+
+            names = await EventService(self.db).session_names(
+                project_id, [row["key"] for row in rows]
+            )
+            for row in rows:
+                row["name"] = names.get(row["key"])
         return rows
 
     async def get_cache_stats(
@@ -423,8 +432,8 @@ class AnalyticsService:
         Returns:
             List of TimeSeriesPoint
         """
-        # Bucket in UTC, matching the UTC window bounds above.
-        ts = utc_timestamp(self._dialect)
+        # Bucket on the caller's clock, matching the window bounds.
+        ts = local_timestamp(self._dialect)
         if granularity == "day":
             time_bucket = func.date(ts)
         else:
@@ -458,9 +467,9 @@ class AnalyticsService:
         
         timeseries = []
         for row in result:
-            # Buckets come back as text (SQLite), date or naive datetime (PG);
-            # all of them are UTC, so label them as such.
-            ts = as_utc_datetime(row.time_bucket)
+            # Buckets come back as the local wall-clock start of the day or
+            # hour; return the instant that is.
+            ts = local_bucket_instant(row.time_bucket)
 
             # Convert Decimal values to int/float for arithmetic operations
             calls = int(row.calls) if row.calls is not None else 0

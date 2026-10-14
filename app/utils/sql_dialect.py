@@ -5,7 +5,7 @@ Primitives for rendering the same query correctly on PostgreSQL and SQLite.
 Services import these instead of sniffing settings.database_url.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func
 
@@ -62,6 +62,35 @@ def stddev_pop(column, dialect: str):
         return func.stddev_pop(column)
     variance = func.avg(column * column) - func.avg(column) * func.avg(column)
     return func.sqrt(func.max(variance, 0))
+
+
+def local_timestamp(dialect: str):
+    """Event.timestamp as wall-clock time in the caller's zone, for bucketing.
+
+    The offset comes from the X-Timezone-Offset header (see client_time), so a
+    day or an hour on a chart is the viewer's own. With no header it is UTC.
+    """
+    from .client_time import offset_minutes
+
+    minutes = offset_minutes()
+    ts = utc_timestamp(dialect)
+    if not minutes:
+        return ts
+    if dialect == "sqlite":
+        return func.datetime(ts, f"{minutes:+d} minutes")
+    return ts + timedelta(minutes=minutes)
+
+
+def local_bucket_instant(value) -> datetime:
+    """A bucket label computed by ``local_timestamp`` back as a real instant.
+
+    The database returns the local wall-clock start of the bucket; the API
+    returns the moment that is, so a client formatting it in its own zone shows
+    the day or hour it was grouped under.
+    """
+    from .client_time import offset
+
+    return as_utc_datetime(value) - offset()
 
 
 def as_utc_datetime(value) -> datetime:

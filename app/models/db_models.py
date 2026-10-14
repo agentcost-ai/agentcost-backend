@@ -515,6 +515,29 @@ class ProjectBaseline(Base):
         return f"<ProjectBaseline {self.project_id} - {self.agent_name}/{self.model}>"
 
 
+class SessionName(Base):
+    """What a session is called, when the client chose to say.
+
+    A coding agent titles each chat. The title belongs to the session, not to
+    any call in it, and is usually written after the first calls were already
+    sent -- so it is stored once here rather than on every event. For a coding
+    agent the session id is also the run's trace id, so one row names both.
+    """
+
+    __tablename__ = "session_names"
+
+    id = Column(String(36), primary_key=True, default=generate_uuid)
+    project_id = Column(String(36), ForeignKey("projects.id"), nullable=False)
+    # Matches Event.session_id's width.
+    session_id = Column(String(255), nullable=False)
+    name = Column(String(255), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("project_id", "session_id", name="uq_session_name_project_session"),
+    )
+
+
 class TraceOutcome(Base):
     """How one run ended. Separate from events: an outcome belongs to the run,
     not to any single call in it."""
