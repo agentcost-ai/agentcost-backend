@@ -305,6 +305,14 @@ class AnalyticsOverview(BaseModel):
     success_rate: float
     period_start: datetime
     period_end: datetime
+    # Every agent and model in the window, not the length of a top-N list.
+    distinct_agents: int = 0
+    distinct_models: int = 0
+    # The same totals over the equal-length window just before this one. Set by
+    # /v1/analytics/overview only; null wherever the overview is built for
+    # something else (the report computes its own deltas).
+    previous_total_cost: Optional[float] = None
+    previous_subscription_cost: Optional[float] = None
 
 
 class AgentStats(BaseModel):
@@ -338,6 +346,8 @@ class TimeSeriesPoint(BaseModel):
     calls: int
     tokens: int
     cost: float
+    # The part of cost covered by a flat subscription, as on the overview.
+    subscription_cost: float = 0.0
     avg_latency_ms: float
 
 

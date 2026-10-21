@@ -55,6 +55,8 @@ class AnalyticsService:
             ).label('subscription_cost'),
             func.avg(func.nullif(Event.latency_ms, 0)).label('avg_latency'),
             func.sum(case((Event.success == True, 1), else_=0)).label('success_count'),
+            func.count(func.distinct(Event.agent_name)).label('distinct_agents'),
+            func.count(func.distinct(Event.model)).label('distinct_models'),
         ).where(
             Event.project_id == project_id,
             Event.timestamp >= start_time,
@@ -92,6 +94,8 @@ class AnalyticsService:
             success_rate=round(success_rate, 2),
             period_start=start_time,
             period_end=end_time,
+            distinct_agents=int(row.distinct_agents or 0),
+            distinct_models=int(row.distinct_models or 0),
         )
     
     async def get_agent_stats(
@@ -456,6 +460,9 @@ class AnalyticsService:
             func.count(Event.id).label('calls'),
             func.sum(Event.total_tokens).label('tokens'),
             func.sum(Event.cost).label('cost'),
+            func.sum(
+                case((Event.billing == "subscription", Event.cost), else_=0.0)
+            ).label('subscription_cost'),
             func.avg(func.nullif(Event.latency_ms, 0)).label('avg_latency'),
         ).where(*filters).group_by(
             time_bucket
@@ -482,9 +489,10 @@ class AnalyticsService:
                 calls=calls,
                 tokens=tokens,
                 cost=round(cost, 6),
+                subscription_cost=round(float(row.subscription_cost or 0.0), 6),
                 avg_latency_ms=round(avg_latency, 2),
             ))
-        
+
         return timeseries
     
     async def get_full_analytics(

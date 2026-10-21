@@ -68,12 +68,23 @@ async def get_overview(
     """
     Get overview metrics for the project.
     
-    Returns total cost, calls, tokens, and averages.
+    Returns total cost, calls, tokens, and averages, plus the cost of the
+    equal-length window just before it so a client can show a change without
+    re-deriving it from a truncated per-agent list.
     """
     start_time, end_time = parse_time_range(range)
-    
+
     analytics = AnalyticsService(db)
-    return await analytics.get_overview(project.id, start_time, end_time)
+    overview = await analytics.get_overview(project.id, start_time, end_time)
+    span = end_time - start_time
+    # Ends a microsecond before this window: get_overview bounds are inclusive,
+    # and a call stamped exactly at start_time belongs to the current window.
+    previous = await analytics.get_overview(
+        project.id, start_time - span, start_time - timedelta(microseconds=1)
+    )
+    overview.previous_total_cost = previous.total_cost
+    overview.previous_subscription_cost = previous.subscription_cost
+    return overview
 
 
 @router.get("/agents", response_model=list[AgentStats])

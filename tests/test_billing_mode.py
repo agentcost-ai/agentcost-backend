@@ -102,3 +102,24 @@ async def test_mixed_batch_is_judged_on_its_metered_part(client, test_project, t
 
     assert response.status_code == 200
     assert response.json()["events_stored"] == 2
+
+
+async def test_timeseries_carries_the_subscription_share_of_each_bucket(client, test_project):
+    await _ingest(
+        client,
+        test_project,
+        _event(metadata={"billing": "subscription"}, cost=8.0),
+        _event(cost=0.5),
+    )
+
+    series = (await client.get("/v1/analytics/timeseries?range=24h&granularity=hour")).json()
+    assert round(sum(p["cost"] for p in series), 6) == 8.5
+    assert round(sum(p["subscription_cost"] for p in series), 6) == 8.0
+
+
+async def test_savings_percentage_is_measured_against_metered_spend(client, test_project):
+    await _ingest(client, test_project, _event(metadata={"billing": "subscription"}, cost=90.0))
+
+    summary = (await client.get("/v1/optimizations/summary")).json()
+    assert summary["current_monthly_spend"] == 0.0
+    assert summary["window_days"] == 30

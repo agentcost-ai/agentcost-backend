@@ -1227,7 +1227,10 @@ class OptimizationService:
         overview = await analytics_service.get_overview(project_id, start_time, end_time)
         
         days_in_period = (end_time - start_time).days or 1
-        monthly_spend = (overview.total_cost / days_in_period) * 30
+        # Metered only: usage a subscription covers is not money a suggestion
+        # can recover, so counting it would shrink every savings percentage.
+        metered_cost = overview.total_cost - overview.subscription_cost
+        monthly_spend = (metered_cost / days_in_period) * 30
         
         savings_percent = (total_savings / monthly_spend * 100) if monthly_spend > 0 else 0
         
@@ -1271,6 +1274,7 @@ class OptimizationService:
             "total_potential_savings_monthly": round(total_savings, 2),
             "total_potential_savings_percent": round(savings_percent, 1),
             "current_monthly_spend": round(monthly_spend, 2),
+            "window_days": days,
             "suggestion_count": len(suggestions),
             "high_priority_count": len(high_priority),
             "by_type": type_breakdown,

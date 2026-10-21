@@ -120,3 +120,31 @@ async def test_model_stats_limit(client: AsyncClient, sample_events):
     models = response.json()
     
     assert len(models) == 1
+
+
+@pytest.mark.asyncio
+async def test_overview_counts_every_agent_and_model_and_the_previous_window(client: AsyncClient, test_project):
+    """The overview's counts are not the length of a top-10 list, and it carries
+    the previous window's cost so a change needs no second query."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+
+    def event(agent, model, cost, when):
+        return {
+            "agent_name": agent, "model": model, "input_tokens": 10, "output_tokens": 1,
+            "timestamp": when.isoformat(), "success": True, "cost": cost,
+        }
+
+    current = [event(f"agent-{i}", f"unpriced-model-{i % 12}", 1.0, now - timedelta(hours=1)) for i in range(14)]
+    earlier = [event("agent-0", "unpriced-model-0", 3.0, now - timedelta(days=10))]
+    response = await client.post(
+        "/v1/events/batch", json={"project_id": test_project.id, "events": current + earlier}
+    )
+    assert response.status_code == 200
+
+    overview = (await client.get("/v1/analytics/overview?range=7d")).json()
+    assert overview["distinct_agents"] == 14
+    assert overview["distinct_models"] == 12
+    assert overview["previous_total_cost"] == 3.0
+    assert overview["previous_subscription_cost"] == 0.0
