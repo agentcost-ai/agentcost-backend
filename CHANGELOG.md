@@ -7,6 +7,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added - whole-project counts and the previous window on the overview
+
+- **`distinct_agents` and `distinct_models` on `GET /v1/analytics/overview`.**
+  Every agent and model in the window. Clients were counting the rows of a
+  top-10 list, so a project with 14 agents showed 10.
+- **`previous_total_cost` and `previous_subscription_cost`.** The same totals
+  over the equal-length window just before this one, ending a microsecond
+  before it so a call stamped exactly at `start_time` is counted once. A client
+  can show a change without summing a truncated per-agent list, which also
+  left out plan usage. Set by `/v1/analytics/overview` only; null wherever the
+  overview is built for something else (the report computes its own deltas).
+- **`subscription_cost` on each `GET /v1/analytics/timeseries` point.** The part
+  of the bucket's cost covered by a flat subscription, as on the overview, so a
+  chart can plot metered spend alone.
+
+### Fixed - savings measured against money a suggestion can recover
+
+- **`GET /v1/optimizations/summary` measures against metered spend.**
+  `current_monthly_spend` now leaves out usage a subscription covers: it is not
+  money a suggestion can recover, and counting it shrank every savings
+  percentage. A project whose usage is all on a plan reports 0. The summary
+  also returns `window_days`, the window the projection was taken over.
+
 ### Fixed - daily figures that moved
 
 - **Day ranges start at midnight, 24h on the hour.** "Last 7 days" was measured
